@@ -234,17 +234,7 @@ public sealed class ConsoleApplication(
         var resolved = await context.RunWithProgress(
             "Resolving package targets",
             $"Resolving 0 of {grouped.Length} packages…",
-            async (token, progress) =>
-            {
-                var output = ImmutableArray.CreateBuilder<PackageGroup>();
-                for (var index = 0; index < grouped.Length; index++)
-                {
-                    token.ThrowIfCancellationRequested();
-                    progress.Report($"Resolving {index + 1} of {grouped.Length}: {grouped[index].Key}");
-                    output.Add(await versions.ResolveAsync(grouped[index], token).ConfigureAwait(false));
-                }
-                return output.ToImmutable();
-            }).ConfigureAwait(false);
+            (token, progress) => versions.ResolveAllAsync(grouped, progress, token)).ConfigureAwait(false);
         if (resolved.IsDefault) throw new OperationCanceledException();
 
         var unavailable = resolved.Where(x => x.ResolutionError is not null).ToArray();

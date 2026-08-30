@@ -8,7 +8,47 @@ namespace DotnetUpdater.Packages;
 
 public sealed class NuGetVersionService(IProcessRunner processRunner)
 {
+    public static int DefaultMaxConcurrency { get; } = Math.Clamp(Environment.ProcessorCount, 2, 8);
+
     private readonly ConcurrentDictionary<string, Task<PackageVersions>> _cache = new(StringComparer.OrdinalIgnoreCase);
+
+    public Task<ImmutableArray<PackageGroup>> ResolveAllAsync(
+        IReadOnlyList<IGrouping<string, PackageOccurrence>> sources,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken) =>
+        ResolveAllAsync(sources, progress, cancellationToken, DefaultMaxConcurrency);
+
+    public async Task<ImmutableArray<PackageGroup>> ResolveAllAsync(
+        IReadOnlyList<IGrouping<string, PackageOccurrence>> sources,
+        IProgress<string>? progress,
+        CancellationToken cancellationToken,
+        int maxConcurrency)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxConcurrency, 1);
+
+        var resolved = new PackageGroup[sources.Count];
+        var completed = 0;
+        var progressGate = new object();
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, sources.Count),
+            new ParallelOptions
+            {
+                CancellationToken = cancellationToken,
+                MaxDegreeOfParallelism = maxConcurrency
+            },
+            async (index, token) =>
+            {
+                var source = sources[index];
+                resolved[index] = await ResolveAsync(source, token).ConfigureAwait(false);
+                lock (progressGate)
+                {
+                    completed++;
+                    progress?.Report($"Resolved {completed} of {sources.Count}: {source.Key}");
+                }
+            }).ConfigureAwait(false);
+
+        return resolved.ToImmutableArray();
+    }
 
     public async Task<PackageGroup> ResolveAsync(IGrouping<string, PackageOccurrence> source, CancellationToken cancellationToken)
     {

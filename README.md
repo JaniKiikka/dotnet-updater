@@ -9,7 +9,7 @@ A keyboard-driven .NET 10 app for reviewing and applying NuGet package updates a
 1. Finds `.sln`, `.slnx`, and standalone `.csproj` files inside Git repositories.
 2. Lets you select projects and ignore packages you do not want to touch.
 3. Groups direct and centrally managed packages by package ID.
-4. Offers minor or major upgrade targets, with major updates clearly marked.
+4. Resolves package targets concurrently using a processor-aware worker count (between two and eight), then offers minor or major upgrades with major updates clearly marked.
 5. Preflights every repository and shows the exact package and Git plan.
 6. Applies approved updates one repository at a time, then restores, builds, and tests.
 

@@ -10,6 +10,46 @@ using DotnetUpdater.Presentation;
 namespace DotnetUpdater.UnitTests;
 
 [TestClass]
+public sealed class NuGetVersionServiceTests
+{
+    [TestMethod]
+    public void DefaultConcurrencyTracksLogicalProcessorsWithinSafeBounds()
+    {
+        Assert.AreEqual(
+            Math.Clamp(Environment.ProcessorCount, 2, 8),
+            NuGetVersionService.DefaultMaxConcurrency);
+    }
+
+    [TestMethod]
+    public async Task ResolveAllRunsWithBoundedConcurrencyAndPreservesInputOrder()
+    {
+        using var temp = new TempDirectory();
+        var groups = Enumerable.Range(0, 8).Select(index =>
+        {
+            var packageId = $"Package.{index}";
+            var project = Path.Combine(temp.Path, $"{packageId}.csproj");
+            var occurrence = new PackageOccurrence(
+                packageId,
+                "1.0.0",
+                project,
+                new(project, packageId, "1.0.0", DeclarationKind.PackageReferenceAttribute, $"PackageReference:{packageId}:attribute"));
+            return new[] { occurrence }.GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase).Single();
+        }).ToArray();
+        var runner = new ConcurrencyTrackingRunner(TimeSpan.FromMilliseconds(25));
+        var progress = new RecordingProgress();
+
+        var resolved = await new NuGetVersionService(runner).ResolveAllAsync(groups, progress, default, maxConcurrency: 3);
+
+        Assert.AreEqual(3, runner.MaximumConcurrency);
+        CollectionAssert.AreEqual(groups.Select(x => x.Key).ToArray(), resolved.Select(x => x.PackageId).ToArray());
+        Assert.IsTrue(resolved.All(x => x.LatestMinor == new SemanticVersion(1, 9, 0)));
+        Assert.IsTrue(resolved.All(x => x.LatestMajor == new SemanticVersion(2, 0, 0)));
+        Assert.HasCount(groups.Length, progress.Messages);
+        StringAssert.StartsWith(progress.Messages[^1], $"Resolved {groups.Length} of {groups.Length}:");
+    }
+}
+
+[TestClass]
 public sealed class DomainTests
 {
     [TestMethod]
@@ -423,5 +463,55 @@ internal sealed class RecordingRunner(Func<ProcessRequest, ProcessResult> respon
     {
         Requests.Add(request);
         return Task.FromResult(response(request));
+    }
+}
+
+internal sealed class ConcurrencyTrackingRunner(TimeSpan delay) : IProcessRunner
+{
+    private readonly object _gate = new();
+    private int _active;
+
+    public int MaximumConcurrency { get; private set; }
+
+    public async Task<ProcessResult> RunAsync(ProcessRequest request, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            _active++;
+            MaximumConcurrency = Math.Max(MaximumConcurrency, _active);
+        }
+
+        try
+        {
+            await Task.Delay(delay, cancellationToken);
+            var project = request.Arguments.SkipWhile(x => x != "--project").Skip(1).First();
+            var packageId = Path.GetFileNameWithoutExtension(project);
+            var latest = request.Arguments.Contains("--highest-minor") ? "1.9.0" : "2.0.0";
+            var json = $$"""{"projects":[{"frameworks":[{"topLevelPackages":[{"id":"{{packageId}}","latestVersion":"{{latest}}"}]}]}]}""";
+            return new(0, json, string.Empty);
+        }
+        finally
+        {
+            lock (_gate) _active--;
+        }
+    }
+}
+
+internal sealed class RecordingProgress : IProgress<string>
+{
+    private readonly object _gate = new();
+    private readonly List<string> _messages = [];
+
+    public IReadOnlyList<string> Messages
+    {
+        get
+        {
+            lock (_gate) return _messages.ToArray();
+        }
+    }
+
+    public void Report(string value)
+    {
+        lock (_gate) _messages.Add(value);
     }
 }
