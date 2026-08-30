@@ -72,12 +72,18 @@ public sealed class GitServiceTests
         }
         finally
         {
-            try
+            for (var attempt = 0; attempt < 3; attempt++)
             {
-                Directory.Delete(temp, true);
-            }
-            catch (IOException)
-            {
+                try
+                {
+                    Directory.Delete(temp, true);
+                    break;
+                }
+                catch (Exception exception) when (
+                    exception is IOException or UnauthorizedAccessException)
+                {
+                    if (attempt < 2) await Task.Delay(500);
+                }
             }
         }
     }
