@@ -6,8 +6,7 @@
     <AssemblyName>dotnet-updater</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <!-- SharpConsoleUI 2.5.14 requests AngleSharp 1.4.0; pin the patched compatible version. -->
-    <PackageReference Include="AngleSharp" Version="1.5.0" />
-    <PackageReference Include="SharpConsoleUI" Version="2.5.14" />
+    <PackageReference Include="AngleSharp" Version="1.7.2" />
+    <PackageReference Include="SharpConsoleUI" Version="2.6.2" />
   </ItemGroup>
 </Project>
