@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>DotnetUpdater</RootNamespace>
+    <AssemblyName>dotnet-updater</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- SharpConsoleUI 2.5.14 requests AngleSharp 1.4.0; pin the patched compatible version. -->
+    <PackageReference Include="AngleSharp" Version="1.5.0" />
+    <PackageReference Include="SharpConsoleUI" Version="2.5.14" />
+  </ItemGroup>
+</Project>

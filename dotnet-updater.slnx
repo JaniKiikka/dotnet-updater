@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/DotnetUpdater/DotnetUpdater.csproj" />
+  <Project Path="tests/DotnetUpdater.UnitTests/DotnetUpdater.UnitTests.csproj" />
+  <Project Path="tests/DotnetUpdater.IntegrationTests/DotnetUpdater.IntegrationTests.csproj" />
+</Solution>

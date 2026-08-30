@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+TestResults/
+
+DESIGN-DOC-PROMPT.md
+DESIGN.md

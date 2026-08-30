@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Build
+        run: dotnet build dotnet-updater.slnx -m:1 --configuration Release
+      - name: Unit tests
+        run: dotnet test --project tests/DotnetUpdater.UnitTests/DotnetUpdater.UnitTests.csproj --configuration Release --no-build --no-restore
+      - name: Local Git integration tests
+        run: dotnet test --project tests/DotnetUpdater.IntegrationTests/DotnetUpdater.IntegrationTests.csproj --configuration Release --no-build --no-restore
