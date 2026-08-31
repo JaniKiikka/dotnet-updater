@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using DotnetUpdater.Configuration;
 using DotnetUpdater.Domain;
 using SharpConsoleUI.Builders;
 using SharpConsoleUI.Controls;
@@ -112,60 +113,147 @@ internal sealed class ChoiceListContent<T> : IFlowStepContent<T> where T : class
 
 internal sealed record ManualDecisionSelection(ImmutableArray<PackageDecision> Decisions);
 
-internal sealed record IgnoredPackageSelection(ImmutableArray<string> PackageIds);
+internal enum PackageRulesActionKind { Save, SelectVersion }
 
-internal sealed class IgnoredPackagesContent : IFlowStepContent<IgnoredPackageSelection>
+internal sealed record PackageRulesAction(PackageRulesActionKind Kind, PackageRuleViewModel? Package = null);
+
+internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
 {
-    private readonly TaskCompletionSource<IgnoredPackageSelection?> completion =
+    private readonly TaskCompletionSource<PackageRulesAction?> completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly IgnoredPackagesViewModel viewModel;
+    private readonly PackageRulesViewModel viewModel;
 
-    public IgnoredPackagesContent(IEnumerable<string> discoveredPackages, IEnumerable<string> ignoredPackages) =>
-        viewModel = new(discoveredPackages, ignoredPackages);
+    public PackageRulesContent(PackageRulesViewModel viewModel) => this.viewModel = viewModel;
 
-    public Task<IgnoredPackageSelection?> Completion => completion.Task;
+    public Task<PackageRulesAction?> Completion => completion.Task;
     public event Action? StateChanged;
 
     public IWindowControl BuildContent(FlowChrome chrome)
     {
         var status = Ctl.Markup().Build();
-        var items = viewModel.Items.Select(package => new ListItem(
-            package.IsDiscovered ? package.PackageId : $"{package.PackageId}  ·  not currently discovered")
-        {
-            Tag = package,
-            IsChecked = package.IsIgnored
-        }).ToArray();
-        var list = Ctl.List("Ignored packages")
+        var items = viewModel.Items.Select(package => new ListItem(package.DisplayText) { Tag = package }).ToArray();
+        var list = Ctl.List("Package update rules")
             .AddItems(items)
-            .WithCheckboxMode()
             .WithVerticalAlignment(VerticalAlignment.Fill)
             .Build();
 
         void UpdateStatus()
         {
-            var count = list.GetCheckedItems().Count;
-            status.SetContent([$"[dim]{count} of {items.Length} ignored · Space toggles · ↑/↓ navigates · Tab reaches actions[/]"]);
+            var ignored = viewModel.Items.Count(x => x.State == PackageRuleState.Ignored);
+            var forced = viewModel.Items.Count(x => x.State == PackageRuleState.Forced);
+            status.SetContent([$"[dim]{ignored} ignored · {forced} forced to exact versions · ↑/↓ navigates · Tab reaches actions[/]"]);
             StateChanged?.Invoke();
         }
 
-        list.CheckedItemsChanged += (_, _) => UpdateStatus();
+        void Refresh(ListItem item)
+        {
+            item.Text = ((PackageRuleViewModel)item.Tag!).DisplayText;
+            UpdateStatus();
+        }
+
         var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
         panel.AddControl(Ctl.Markup()
-            .AddLine("[bold]Choose the packages that upgrade runs should ignore.[/]")
-            .AddLine("[dim]Checked packages are ignored. Saved packages that are not in the current scan remain available so they can be removed.[/]")
+            .AddLine("[bold]Choose which packages are ignored and which are forced to exact versions.[/]")
+            .AddLine("[dim][IGNORED] packages are skipped. [FORCED] packages are set to the shown version on every run, including downgrades and prereleases.[/]")
+            .AddLine("[dim]Saved packages not found in this scan stay visible so their rules can be cleared.[/]")
             .WithMargin(1)
             .Build());
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Ignore all").OnClick((_, _) => list.SetAllChecked(true)).Build());
-        panel.AddControl(Ctl.Button("Clear ignored").OnClick((_, _) => list.SetAllChecked(false)).Build());
-        panel.AddControl(Ctl.Button("Save ignored packages")
-            .OnClick((_, _) => completion.TrySetResult(new IgnoredPackageSelection(
-                IgnoredPackagesViewModel.Normalize(list.GetCheckedItems()
-                    .Select(x => ((IgnoredPackageViewModel)x.Tag!).PackageId)))))
+        panel.AddControl(Ctl.Button("Toggle ignored")
+            .OnClick((_, _) =>
+            {
+                if (list.SelectedItem is not { } item) return;
+                ((PackageRuleViewModel)item.Tag!).ToggleIgnored();
+                Refresh(item);
+            })
+            .Build());
+        panel.AddControl(Ctl.Button("Force selected version")
+            .OnClick((_, _) =>
+            {
+                if (list.SelectedItem?.Tag is not PackageRuleViewModel package) return;
+                if (!package.IsDiscovered)
+                {
+                    status.SetContent(["[yellow]This package is not currently discovered, so no effective NuGet source can be queried.[/]"]);
+                    return;
+                }
+                completion.TrySetResult(new(PackageRulesActionKind.SelectVersion, package));
+            })
+            .Build());
+        panel.AddControl(Ctl.Button("Clear selected rule")
+            .OnClick((_, _) =>
+            {
+                if (list.SelectedItem is not { } item) return;
+                ((PackageRuleViewModel)item.Tag!).Clear();
+                Refresh(item);
+            })
+            .Build());
+        panel.AddControl(Ctl.Button("Save package rules")
+            .OnClick((_, _) => completion.TrySetResult(new(PackageRulesActionKind.Save)))
             .Build());
         panel.AddControl(Ctl.Button("Back without saving").OnClick((_, _) => completion.TrySetCanceled()).Build());
         UpdateStatus();
+        return panel;
+    }
+}
+
+internal sealed record PackageVersionSelection(string Version);
+
+internal sealed class PackageVersionSelectionContent : IFlowStepContent<PackageVersionSelection>
+{
+    private readonly TaskCompletionSource<PackageVersionSelection?> completion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly string packageId;
+    private readonly ImmutableArray<string> versions;
+
+    public PackageVersionSelectionContent(string packageId, ImmutableArray<string> versions)
+    {
+        this.packageId = packageId;
+        this.versions = versions;
+    }
+
+    public Task<PackageVersionSelection?> Completion => completion.Task;
+    public event Action? StateChanged;
+
+    public IWindowControl BuildContent(FlowChrome chrome)
+    {
+        var status = Ctl.Markup().Build();
+        var list = Ctl.List("Available versions")
+            .WithVerticalAlignment(VerticalAlignment.Fill)
+            .OnItemActivated((_, item) => completion.TrySetResult(new(item.Text)))
+            .Build();
+
+        void Filter(string search)
+        {
+            var filtered = PackageVersionSearch.Filter(versions, search)
+                .Select(x => new ListItem(x))
+                .ToList();
+            list.Items = filtered;
+            status.SetContent([$"[dim]{filtered.Count} of {versions.Length} versions shown · stable and prerelease releases included[/]"]);
+            StateChanged?.Invoke();
+        }
+
+        var search = Ctl.Prompt("Search: ")
+            .WithPlaceholder("type any part of a version")
+            .OnInputChanged((_, value) => Filter(value))
+            .Build();
+        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        panel.AddControl(Ctl.Markup()
+            .AddLine($"[bold]Force {PresentationText.Escape(packageId)} to an exact version.[/]")
+            .AddLine("[dim]The list contains every version returned by the configured NuGet sources, including prereleases.[/]")
+            .WithMargin(1)
+            .Build());
+        panel.AddControl(search);
+        panel.AddControl(list);
+        panel.AddControl(status);
+        panel.AddControl(Ctl.Button("Use selected version")
+            .OnClick((_, _) =>
+            {
+                if (list.SelectedItem is { } item) completion.TrySetResult(new(item.Text));
+            })
+            .Build());
+        panel.AddControl(Ctl.Button("Cancel").OnClick((_, _) => completion.TrySetCanceled()).Build());
+        Filter(string.Empty);
         return panel;
     }
 }
@@ -175,8 +263,12 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
     private readonly TaskCompletionSource<ManualDecisionSelection?> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ImmutableArray<PackageDecisionViewModel> decisions;
 
-    public PackageDecisionContent(ImmutableArray<PackageGroup> groups) =>
-        decisions = groups.Select(x => new PackageDecisionViewModel(x)).ToImmutableArray();
+    public PackageDecisionContent(
+        ImmutableArray<PackageGroup> groups,
+        IReadOnlyDictionary<string, string> forcedVersions) =>
+        decisions = groups.Select(x => new PackageDecisionViewModel(
+            x,
+            forcedVersions.GetValueOrDefault(x.PackageId))).ToImmutableArray();
 
     public Task<ManualDecisionSelection?> Completion => completion.Task;
     public event Action? StateChanged;
@@ -193,9 +285,10 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
 
         void UpdateStatus()
         {
-            var updates = decisions.Count(x => x.Choice is UpgradeChoice.LatestMinor or UpgradeChoice.LatestMajor);
+            var updates = decisions.Count(x => x.Choice is UpgradeChoice.LatestMinor or UpgradeChoice.LatestMajor or UpgradeChoice.ExactVersion);
             var majors = decisions.Count(x => x.Choice == UpgradeChoice.LatestMajor);
-            status.SetContent([$"[dim]{updates} update(s) · {majors} major · Enter cycles selected package[/]"]);
+            var forced = decisions.Count(x => x.IsForced);
+            status.SetContent([$"[dim]{updates} update(s) · {majors} major · {forced} forced · Enter cycles unforced packages[/]"]);
             StateChanged?.Invoke();
         }
 
@@ -210,7 +303,7 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
         var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
         panel.AddControl(Ctl.Markup()
             .AddLine("[bold]Set one decision per package.[/]")
-            .AddLine("[dim]Choices cycle: no update → latest minor → latest major.[/]")
+            .AddLine("[dim]Choices cycle: no update → latest minor → latest major. Persistent forced versions are shown but cannot be changed here.[/]")
             .WithMargin(1)
             .Build());
         panel.AddControl(list);

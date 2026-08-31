@@ -3,14 +3,95 @@ using System.Collections.Immutable;
 using System.Text.Json;
 using DotnetUpdater.Domain;
 using DotnetUpdater.Execution;
+using NuGet.Common;
+using NuGet.Configuration;
+using NuGet.Protocol;
+using NuGet.Protocol.Core.Types;
+using NuGetVersion = NuGet.Versioning.NuGetVersion;
+using NuGetVersionComparer = NuGet.Versioning.VersionComparer;
 
 namespace DotnetUpdater.Packages;
 
-public sealed class NuGetVersionService(IProcessRunner processRunner)
+public sealed record PackageVersionLookup(ImmutableArray<string> Versions, string? Error);
+
+public interface IAllPackageVersionsSource
 {
+    Task<PackageVersionLookup> GetAllAsync(string projectPath, string packageId, CancellationToken cancellationToken);
+}
+
+public sealed class ConfiguredNuGetVersionSource : IAllPackageVersionsSource
+{
+    public async Task<PackageVersionLookup> GetAllAsync(
+        string projectPath,
+        string packageId,
+        CancellationToken cancellationToken)
+    {
+        var settings = Settings.LoadDefaultSettings(Path.GetDirectoryName(projectPath));
+        var sourceProvider = new PackageSourceProvider(settings);
+        var repositories = new SourceRepositoryProvider(sourceProvider, Repository.Provider.GetCoreV3())
+            .GetRepositories()
+            .ToArray();
+        var versions = new HashSet<NuGetVersion>(NuGetVersionComparer.VersionReleaseMetadata);
+        var errors = new List<string>();
+        var successfulSources = 0;
+
+        using var cache = new SourceCacheContext();
+        foreach (var repository in repositories)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var resource = await repository.GetResourceAsync<FindPackageByIdResource>(cancellationToken)
+                    .ConfigureAwait(false);
+                if (resource is null)
+                    throw new InvalidOperationException("The source does not support package version lookup.");
+                var found = await resource.GetAllVersionsAsync(
+                    packageId,
+                    cache,
+                    NullLogger.Instance,
+                    cancellationToken).ConfigureAwait(false);
+                versions.UnionWith(found);
+                successfulSources++;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                errors.Add($"{repository.PackageSource.Name}: {ex.Message}");
+            }
+        }
+
+        var ordered = versions
+            .OrderByDescending(x => x, NuGetVersionComparer.VersionReleaseMetadata)
+            .Select(x => x.ToNormalizedString())
+            .ToImmutableArray();
+        var error = successfulSources == 0
+            ? errors.Count == 0
+                ? "No enabled NuGet sources are configured for this project."
+                : $"All configured NuGet sources failed: {string.Join("; ", errors)}"
+            : null;
+        return new(ordered, error);
+    }
+}
+
+public sealed class NuGetVersionService
+{
+    private readonly IProcessRunner processRunner;
+    private readonly IAllPackageVersionsSource allVersionsSource;
+
+    public NuGetVersionService(IProcessRunner processRunner, IAllPackageVersionsSource? allVersionsSource = null)
+    {
+        this.processRunner = processRunner;
+        this.allVersionsSource = allVersionsSource ?? new ConfiguredNuGetVersionSource();
+    }
+
     public static int DefaultMaxConcurrency { get; } = Math.Clamp(Environment.ProcessorCount, 2, 8);
 
     private readonly ConcurrentDictionary<string, Task<PackageVersions>> _cache = new(StringComparer.OrdinalIgnoreCase);
+
+    public Task<PackageVersionLookup> GetAllVersionsAsync(
+        string projectPath,
+        string packageId,
+        CancellationToken cancellationToken) =>
+        allVersionsSource.GetAllAsync(projectPath, packageId, cancellationToken);
 
     public Task<ImmutableArray<PackageGroup>> ResolveAllAsync(
         IReadOnlyList<IGrouping<string, PackageOccurrence>> sources,

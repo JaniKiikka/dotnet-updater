@@ -6,12 +6,15 @@ namespace DotnetUpdater.Configuration;
 public sealed record AppConfiguration(
     string ProjectsFolder,
     ImmutableArray<string> IgnoredPackages,
+    ImmutableArray<PackageVersionLock> ForcedPackageVersions,
     string DevelopmentBranch,
     string RemoteName)
 {
     public static AppConfiguration Default(string projectsFolder = "") =>
-        new(projectsFolder, [], "development", "origin");
+        new(projectsFolder, [], [], "development", "origin");
 }
+
+public sealed record PackageVersionLock(string PackageId, string Version);
 
 public sealed record ConfigurationLoadResult(AppConfiguration Configuration, string? Warning);
 
@@ -75,14 +78,25 @@ public sealed class JsonConfigurationStore(IConfigurationPathProvider pathProvid
 
     public static AppConfiguration Normalize(AppConfiguration configuration)
     {
-        var ignored = configuration.IgnoredPackages
+        var ignored = (configuration.IgnoredPackages.IsDefault ? [] : configuration.IgnoredPackages)
             .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim())
             .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToImmutableArray();
+        var ignoredSet = ignored.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var forced = (configuration.ForcedPackageVersions.IsDefault ? [] : configuration.ForcedPackageVersions)
+            .Where(x => x is not null && !string.IsNullOrWhiteSpace(x.PackageId) &&
+                Domain.SemanticVersion.TryParse(x.Version, out _))
+            .Select(x => new PackageVersionLock(x.PackageId.Trim(), x.Version.Trim()))
+            .Where(x => !ignoredSet.Contains(x.PackageId))
+            .GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new PackageVersionLock(x.First().PackageId, x.Last().Version))
+            .OrderBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase)
             .ToImmutableArray();
         return configuration with
         {
             ProjectsFolder = configuration.ProjectsFolder?.Trim() ?? string.Empty,
             IgnoredPackages = ignored,
+            ForcedPackageVersions = forced,
             DevelopmentBranch = string.IsNullOrWhiteSpace(configuration.DevelopmentBranch) ? "development" : configuration.DevelopmentBranch.Trim(),
             RemoteName = string.IsNullOrWhiteSpace(configuration.RemoteName) ? "origin" : configuration.RemoteName.Trim()
         };

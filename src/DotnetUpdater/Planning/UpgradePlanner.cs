@@ -28,11 +28,15 @@ public sealed class UpgradePlanner
 
             foreach (var occurrence in group.Occurrences.Where(x => x.UnsupportedReason is null))
             {
-                if (!SemanticVersion.TryParse(occurrence.CurrentVersion, out var current) || target.CompareTo(current) <= 0) continue;
+                if (!SemanticVersion.TryParse(occurrence.CurrentVersion, out var current)) continue;
+                var isForced = decision.Choice == UpgradeChoice.ExactVersion;
+                if (isForced
+                    ? string.Equals(occurrence.CurrentVersion, decision.TargetVersion, StringComparison.OrdinalIgnoreCase)
+                    : target.CompareTo(current) <= 0) continue;
                 var repository = selected.FirstOrDefault(x => x.ProjectPaths.Contains(occurrence.ProjectPath, PathComparer))?.RepositoryRoot;
                 if (repository is null) continue;
                 edits.Add(new(repository, occurrence.Declaration.Path, occurrence.PackageId, occurrence.CurrentVersion,
-                    decision.TargetVersion!, occurrence.Declaration.Kind, occurrence.Declaration.Locator));
+                    decision.TargetVersion!, occurrence.Declaration.Kind, occurrence.Declaration.Locator, isForced));
             }
         }
 

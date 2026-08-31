@@ -173,10 +173,10 @@ public sealed class ConsoleApplication(
                 parent,
                 "Choose an action",
                 new ChoiceListContent<ApplicationActionOption>(
-                    "Start an upgrade run or edit the persistent package ignore list.",
+                    "Start an upgrade run or edit persistent package update rules.",
                     [
                         ("Upgrade packages", "select projects and plan package updates", new(ApplicationAction.UpgradePackages, "Upgrade packages", "")),
-                        ("Ignored packages", "toggle ignored packages from the combined project inventory", new(ApplicationAction.ManageIgnoredPackages, "Ignored packages", ""))
+                        ("Package rules", "mark packages as ignored or force exact versions", new(ApplicationAction.ManagePackageRules, "Package rules", ""))
                     ]),
                 cancellationToken,
                 width: 84,
@@ -184,7 +184,7 @@ public sealed class ConsoleApplication(
             if (action is null) throw new OperationCanceledException();
             if (action.Action == ApplicationAction.UpgradePackages) break;
 
-            configuration = await ManageIgnoredPackagesAsync(
+            configuration = await ManagePackageRulesAsync(
                 windowSystem,
                 parent,
                 context,
@@ -203,6 +203,10 @@ public sealed class ConsoleApplication(
         var selected = entrySelection.Entries;
 
         var ignored = configuration.IgnoredPackages.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var forcedVersions = configuration.ForcedPackageVersions.ToDictionary(
+            x => x.PackageId,
+            x => x.Version,
+            StringComparer.OrdinalIgnoreCase);
         var inventoryResult = await context.RunWithProgress(
             "Reading package inventory",
             "Combining package declarations across the selection…",
@@ -231,11 +235,19 @@ public sealed class ConsoleApplication(
         var grouped = eligible.GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase)
             .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var resolved = await context.RunWithProgress(
-            "Resolving package targets",
-            $"Resolving 0 of {grouped.Length} packages…",
-            (token, progress) => versions.ResolveAllAsync(grouped, progress, token)).ConfigureAwait(false);
-        if (resolved.IsDefault) throw new OperationCanceledException();
+        var floatingGroups = grouped.Where(x => !forcedVersions.ContainsKey(x.Key)).ToArray();
+        var floatingResolved = floatingGroups.Length == 0
+            ? ImmutableArray<PackageGroup>.Empty
+            : await context.RunWithProgress(
+                "Resolving package targets",
+                $"Resolving 0 of {floatingGroups.Length} packages…",
+                (token, progress) => versions.ResolveAllAsync(floatingGroups, progress, token)).ConfigureAwait(false);
+        if (floatingResolved.IsDefault) throw new OperationCanceledException();
+        var floatingById = floatingResolved.ToDictionary(x => x.PackageId, StringComparer.OrdinalIgnoreCase);
+        var resolved = grouped.Select(group => forcedVersions.ContainsKey(group.Key)
+                ? new PackageGroup(group.Key, group.ToImmutableArray(), null, null, null)
+                : floatingById[group.Key])
+            .ToImmutableArray();
 
         var unavailable = resolved.Where(x => x.ResolutionError is not null).ToArray();
         if (unavailable.Length > 0)
@@ -265,6 +277,8 @@ public sealed class ConsoleApplication(
         {
             var choice = mode.Mode == UpgradeMode.LatestMinor ? UpgradeChoice.LatestMinor : UpgradeChoice.LatestMajor;
             foreach (var group in resolved) decisions[group.PackageId] = UpgradePlanner.AutomaticDecision(group, choice);
+            foreach (var forced in forcedVersions.Where(x => decisions.ContainsKey(x.Key)))
+                decisions[forced.Key] = new(forced.Key, UpgradeChoice.ExactVersion, forced.Value);
         }
         else
         {
@@ -272,7 +286,7 @@ public sealed class ConsoleApplication(
                 windowSystem,
                 parent,
                 "Select package upgrades",
-                new PackageDecisionContent(resolved),
+                new PackageDecisionContent(resolved, forcedVersions),
                 cancellationToken,
                 width: 110,
                 height: 32).ConfigureAwait(false);
@@ -406,7 +420,7 @@ public sealed class ConsoleApplication(
         return updated;
     }
 
-    private async Task<AppConfiguration> ManageIgnoredPackagesAsync(
+    private async Task<AppConfiguration> ManagePackageRulesAsync(
         ConsoleWindowSystem windowSystem,
         Window parent,
         FlowContext context,
@@ -430,20 +444,63 @@ public sealed class ConsoleApplication(
                 string.Join('\n', result.Warnings.Select(x => $"• {PresentationText.Escape(x)}")),
                 cancellationToken).ConfigureAwait(false);
 
-        var packageIds = result.Occurrences.Select(x => x.PackageId);
-        var selection = await PresentAsync(
-            windowSystem,
-            parent,
-            "Ignored packages",
-            new IgnoredPackagesContent(packageIds, configuration.IgnoredPackages),
-            cancellationToken,
-            width: 100,
-            height: 30).ConfigureAwait(false);
-        if (selection is null) return configuration;
+        var viewModel = new PackageRulesViewModel(
+            result.Occurrences,
+            configuration.IgnoredPackages,
+            configuration.ForcedPackageVersions);
+        while (true)
+        {
+            var action = await PresentAsync(
+                windowSystem,
+                parent,
+                "Package update rules",
+                new PackageRulesContent(viewModel),
+                cancellationToken,
+                width: 110,
+                height: 34).ConfigureAwait(false);
+            if (action is null) return configuration;
+            if (action.Kind == PackageRulesActionKind.Save)
+            {
+                var updated = configuration with
+                {
+                    IgnoredPackages = viewModel.IgnoredPackages,
+                    ForcedPackageVersions = viewModel.ForcedVersions
+                };
+                await configurationStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+                return updated;
+            }
 
-        var updated = configuration with { IgnoredPackages = selection.PackageIds };
-        await configurationStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
-        return updated;
+            var package = action.Package!;
+            var lookup = await context.RunWithProgress(
+                "Loading package versions",
+                $"Querying configured NuGet sources for every {package.PackageId} version…",
+                (token, _) => versions.GetAllVersionsAsync(
+                    package.ProjectPath!,
+                    package.PackageId,
+                    token)).ConfigureAwait(false);
+            if (lookup is null) throw new OperationCanceledException();
+            if (lookup.Error is not null || lookup.Versions.Length == 0)
+            {
+                var message = lookup.Error ?? "The configured NuGet sources returned no versions for this package.";
+                await ShowMessageAsync(
+                    windowSystem,
+                    parent,
+                    "Package versions unavailable",
+                    PresentationText.Escape(message),
+                    cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            var selection = await PresentAsync(
+                windowSystem,
+                parent,
+                $"Select {package.PackageId} version",
+                new PackageVersionSelectionContent(package.PackageId, lookup.Versions),
+                cancellationToken,
+                width: 92,
+                height: 32).ConfigureAwait(false);
+            if (selection is not null) package.Force(selection.Version);
+        }
     }
 
     private static async Task<GitWorkflowOptions> ReadGitWorkflowAsync(

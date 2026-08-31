@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.IO.Compression;
 using DotnetUpdater.Configuration;
 using DotnetUpdater.Discovery;
 using DotnetUpdater.Domain;
@@ -47,6 +48,69 @@ public sealed class NuGetVersionServiceTests
         Assert.HasCount(groups.Length, progress.Messages);
         StringAssert.StartsWith(progress.Messages[^1], $"Resolved {groups.Length} of {groups.Length}:");
     }
+
+    [TestMethod]
+    public async Task ExactVersionLookupReturnsEveryStableAndPrereleaseVersion()
+    {
+        var source = new RecordingAllVersionsSource(
+            new(["2.0.0", "2.0.0-rc.1", "1.0.0"], null));
+        var service = new NuGetVersionService(new RecordingRunner(_ => new(0, "", "")), source);
+
+        var result = await service.GetAllVersionsAsync("/repo/App.csproj", "Example.Package", default);
+
+        CollectionAssert.AreEqual(new[] { "2.0.0", "2.0.0-rc.1", "1.0.0" }, result.Versions.ToArray());
+        Assert.AreEqual(("/repo/App.csproj", "Example.Package"), source.Request);
+    }
+
+    [TestMethod]
+    public async Task ConfiguredSourceReadsAllVersionsFromEffectiveLocalNuGetConfig()
+    {
+        using var temp = new TempDirectory();
+        var feed = Directory.CreateDirectory(Path.Combine(temp.Path, "feed")).FullName;
+        var project = Path.Combine(temp.Path, "App.csproj");
+        File.WriteAllText(project, "<Project />");
+        File.WriteAllText(Path.Combine(temp.Path, "NuGet.Config"), $$"""
+            <configuration>
+              <packageSources>
+                <clear />
+                <add key="local-test" value="{{feed}}" />
+              </packageSources>
+            </configuration>
+            """);
+        CreatePackage(feed, "Example.Package", "1.0.0");
+        CreatePackage(feed, "Example.Package", "2.0.0-rc.1");
+        CreatePackage(feed, "Example.Package", "2.0.0");
+
+        var result = await new ConfiguredNuGetVersionSource().GetAllAsync(
+            project,
+            "Example.Package",
+            default);
+
+        Assert.IsNull(result.Error);
+        CollectionAssert.AreEqual(
+            new[] { "2.0.0", "2.0.0-rc.1", "1.0.0" },
+            result.Versions.ToArray());
+    }
+
+    private static void CreatePackage(string feed, string packageId, string version)
+    {
+        using var archive = ZipFile.Open(
+            Path.Combine(feed, $"{packageId}.{version}.nupkg"),
+            ZipArchiveMode.Create);
+        var entry = archive.CreateEntry($"{packageId}.nuspec");
+        using var writer = new StreamWriter(entry.Open());
+        writer.Write($$"""
+            <?xml version="1.0"?>
+            <package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+              <metadata>
+                <id>{{packageId}}</id>
+                <version>{{version}}</version>
+                <authors>Tests</authors>
+                <description>Test package</description>
+              </metadata>
+            </package>
+            """);
+    }
 }
 
 [TestClass]
@@ -90,11 +154,18 @@ public sealed class ConfigurationStoreTests
         var path = Path.Combine(temp.Path, "settings.json");
         var store = new JsonConfigurationStore(new FixedPath(path));
 
-        await store.SaveAsync(new(temp.Path, ["Serilog", "serilog", "  NUnit  "], "", ""), default);
+        await store.SaveAsync(new(
+            temp.Path,
+            ["Serilog", "serilog", "  NUnit  "],
+            [new("  Example.Package ", " 2.1.0-beta.1 "), new("example.package", "2.1.0-beta.2")],
+            "",
+            ""), default);
         var loaded = await store.LoadAsync(default);
 
         Assert.IsNull(loaded.Warning);
         CollectionAssert.AreEqual(new[] { "NUnit", "Serilog" }, loaded.Configuration.IgnoredPackages.ToArray());
+        Assert.AreEqual("Example.Package", loaded.Configuration.ForcedPackageVersions.Single().PackageId);
+        Assert.AreEqual("2.1.0-beta.2", loaded.Configuration.ForcedPackageVersions.Single().Version);
         Assert.AreEqual("development", loaded.Configuration.DevelopmentBranch);
         Assert.AreEqual("origin", loaded.Configuration.RemoteName);
         Assert.IsFalse(Directory.EnumerateFiles(temp.Path, "*.tmp").Any());
@@ -112,6 +183,28 @@ public sealed class ConfigurationStoreTests
 
         Assert.IsNotNull(loaded.Warning);
         Assert.AreEqual("{not-json", await File.ReadAllTextAsync(path));
+    }
+
+    [TestMethod]
+    public async Task LoadAcceptsSettingsWrittenBeforeForcedVersionsExisted()
+    {
+        using var temp = new TempDirectory();
+        var path = Path.Combine(temp.Path, "settings.json");
+        await File.WriteAllTextAsync(path, $$"""
+            {
+              "projectsFolder": "{{temp.Path}}",
+              "ignoredPackages": ["Serilog"],
+              "developmentBranch": "development",
+              "remoteName": "origin"
+            }
+            """);
+        var store = new JsonConfigurationStore(new FixedPath(path));
+
+        var loaded = await store.LoadAsync(default);
+
+        Assert.IsNull(loaded.Warning);
+        CollectionAssert.AreEqual(new[] { "Serilog" }, loaded.Configuration.IgnoredPackages.ToArray());
+        Assert.IsEmpty(loaded.Configuration.ForcedPackageVersions);
     }
 }
 
@@ -213,6 +306,40 @@ public sealed class UpgradePlannerTests
         Assert.AreEqual("7.1.0", plan.Repositories.Single().Edits.Single().TargetVersion);
         Assert.AreEqual("development", plan.Git.BaseBranch);
         Assert.AreEqual("version-update", plan.Git.TargetBranch);
+    }
+
+    [TestMethod]
+    public void ForcedExactVersionCanIntentionallyDowngradeAndIsMarkedInPlan()
+    {
+        using var temp = new TempDirectory();
+        var project = Path.Combine(temp.Path, "App.csproj");
+        var declaration = new PackageDeclaration(
+            project,
+            "Example.Package",
+            "3.0.0",
+            DeclarationKind.PackageReferenceAttribute,
+            "PackageReference:Example.Package:attribute");
+        var group = new PackageGroup(
+            "Example.Package",
+            [new("Example.Package", "3.0.0", project, declaration)],
+            null,
+            null,
+            null);
+        var entry = new SelectionEntry(project, temp.Path, EntryKind.StandaloneProject, [project]);
+        var decisions = new Dictionary<string, PackageDecision>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Example.Package"] = new("Example.Package", UpgradeChoice.ExactVersion, "2.0.0-rc.1")
+        };
+
+        var edit = new UpgradePlanner().Create(
+            [entry],
+            [group],
+            decisions,
+            new("origin", null, null, false),
+            DateTimeOffset.UnixEpoch).Repositories.Single().Edits.Single();
+
+        Assert.AreEqual("2.0.0-rc.1", edit.TargetVersion);
+        Assert.IsTrue(edit.IsForced);
     }
 }
 
@@ -379,16 +506,37 @@ public sealed class RunCoordinatorTests
 public sealed class PresentationViewModelTests
 {
     [TestMethod]
-    public void IgnoredPackageViewCombinesDiscoveredAndSavedPackagesCaseInsensitively()
+    public void PackageRulesClearlyCombineDiscoveredIgnoredAndForcedPackages()
     {
-        var viewModel = new IgnoredPackagesViewModel(
-            [" Serilog ", "NUnit", "serilog"],
-            ["nunit", "Moq"]);
+        var declaration = new PackageDeclaration("/repo/App.csproj", "Serilog", "4.0.0",
+            DeclarationKind.PackageReferenceAttribute, "package");
+        var occurrences = new[]
+        {
+            new PackageOccurrence("Serilog", "4.0.0", "/repo/App.csproj", declaration),
+            new PackageOccurrence("NUnit", "4.1.0", "/repo/App.csproj", declaration)
+        };
+        var viewModel = new PackageRulesViewModel(
+            occurrences,
+            ["nunit"],
+            [new("Moq", "5.0.0-preview.1")]);
 
         CollectionAssert.AreEqual(new[] { "Moq", "NUnit", "Serilog" }, viewModel.Items.Select(x => x.PackageId).ToArray());
-        Assert.IsFalse(viewModel.Items.Single(x => x.PackageId == "Serilog").IsIgnored);
-        Assert.IsTrue(viewModel.Items.Single(x => x.PackageId == "NUnit").IsIgnored);
+        Assert.AreEqual(PackageRuleState.Normal, viewModel.Items.Single(x => x.PackageId == "Serilog").State);
+        Assert.AreEqual(PackageRuleState.Ignored, viewModel.Items.Single(x => x.PackageId == "NUnit").State);
+        Assert.AreEqual(PackageRuleState.Forced, viewModel.Items.Single(x => x.PackageId == "Moq").State);
         Assert.IsFalse(viewModel.Items.Single(x => x.PackageId == "Moq").IsDiscovered);
+        StringAssert.Contains(viewModel.Items.Single(x => x.PackageId == "NUnit").DisplayText, "[IGNORED]");
+        StringAssert.Contains(viewModel.Items.Single(x => x.PackageId == "Moq").DisplayText, "[FORCED");
+    }
+
+    [TestMethod]
+    public void PackageVersionSearchIncludesAndFiltersPrereleases()
+    {
+        var result = PackageVersionSearch.Filter(
+            ["3.0.0", "3.0.0-rc.2", "2.5.0-beta.1", "2.4.0"],
+            "beta");
+
+        CollectionAssert.AreEqual(new[] { "2.5.0-beta.1" }, result.ToArray());
     }
 
     [TestMethod]
@@ -513,5 +661,19 @@ internal sealed class RecordingProgress : IProgress<string>
     public void Report(string value)
     {
         lock (_gate) _messages.Add(value);
+    }
+}
+
+internal sealed class RecordingAllVersionsSource(PackageVersionLookup response) : IAllPackageVersionsSource
+{
+    public (string ProjectPath, string PackageId)? Request { get; private set; }
+
+    public Task<PackageVersionLookup> GetAllAsync(
+        string projectPath,
+        string packageId,
+        CancellationToken cancellationToken)
+    {
+        Request = (projectPath, packageId);
+        return Task.FromResult(response);
     }
 }

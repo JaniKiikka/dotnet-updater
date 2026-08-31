@@ -52,7 +52,7 @@ public sealed record PackageGroup(
         .DefaultIfEmpty(0).Max();
 }
 
-public enum UpgradeChoice { LatestMinor, LatestMajor, NoUpdate }
+public enum UpgradeChoice { LatestMinor, LatestMajor, ExactVersion, NoUpdate }
 
 public sealed record PackageDecision(string PackageId, UpgradeChoice Choice, string? TargetVersion);
 
@@ -63,7 +63,8 @@ public sealed record DeclarationEdit(
     string OldVersion,
     string TargetVersion,
     DeclarationKind Kind,
-    string Locator);
+    string Locator,
+    bool IsForced = false);
 
 public sealed record RepositoryPlan(
     string RepositoryRoot,
@@ -106,7 +107,9 @@ public sealed class RepositoryStateMachine
         [RunStage.Test] = [RunStage.Test, RunStage.Commit, RunStage.Passed, RunStage.Failed],
         [RunStage.Commit] = [RunStage.Push, RunStage.Skipped, RunStage.Failed],
         [RunStage.Push] = [RunStage.Passed, RunStage.Failed],
-        [RunStage.Passed] = [], [RunStage.Failed] = [], [RunStage.Skipped] = []
+        [RunStage.Passed] = [],
+        [RunStage.Failed] = [],
+        [RunStage.Skipped] = []
     };
 
     public RunStage Current { get; private set; } = RunStage.Queued;

@@ -7,7 +7,7 @@ A keyboard-driven .NET 10 app for reviewing and applying NuGet package updates a
 ## What it does
 
 1. Finds `.sln`, `.slnx`, and standalone `.csproj` files inside Git repositories.
-2. Lets you select projects and ignore packages you do not want to touch.
+2. Lets you select projects, ignore packages you do not want to touch, and persistently force selected packages to exact versions.
 3. Groups direct and centrally managed packages by package ID.
 4. Resolves package targets concurrently using a processor-aware worker count (between two and eight), then offers minor or major upgrades with major updates clearly marked.
 5. Preflights every repository and shows the exact package and Git plan.
@@ -31,11 +31,11 @@ Use `Tab` and `Shift+Tab` to move focus, the arrow keys to navigate, `Space` to 
 - A literal `<Version>...</Version>` inside `PackageReference`
 - `PackageVersion` entries in the nearest in-repository `Directory.Packages.props`
 
-The updater sticks to stable versions. Conditional declarations, properties, ranges, wildcards, missing versions, and ambiguous duplicates are reported and left alone.
+The automatic latest-minor and latest-major modes stick to stable versions. From **Package rules**, you can instead force a package to any exact version returned by its configured NuGet sources—including a prerelease—and that rule is applied on later runs. Conditional declarations, properties, ranges, wildcards, missing versions, and ambiguous duplicates are reported and left alone.
 
 ## Settings and logs
 
-Settings live in the operating system's per-user application-data directory at `dotnet-updater/settings.json`. This includes the ignored-package list, which you can edit from **Ignored packages** in the app. Invalid configuration is preserved and reported rather than overwritten.
+Settings live in the operating system's per-user application-data directory at `dotnet-updater/settings.json`. This includes package rules, which you edit from **Package rules** in the app. Each package is clearly labeled as updates enabled, ignored, or forced to an exact version. The exact-version picker loads all versions from the package's effective NuGet sources, supports search, and includes prereleases. Ignored packages and forced versions both persist between runs. Invalid configuration is preserved and reported rather than overwritten.
 
 Logs are written under the per-user local application-data directory at `dotnet-updater/logs`, falling back to the system temporary directory when needed. Command output is redacted, and files use user-only permissions on Unix-like systems where supported.
 

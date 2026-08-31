@@ -22,7 +22,8 @@ public static class PresentationText
             foreach (var edit in repository.Edits)
             {
                 var major = IsMajor(edit) ? " [bold yellow]MAJOR[/]" : string.Empty;
-                lines.Add($"  • {Escape(edit.PackageId)}: {Escape(edit.OldVersion)} → {Escape(edit.TargetVersion)}{major}");
+                var forced = edit.IsForced ? " [bold magenta]FORCED[/]" : string.Empty;
+                lines.Add($"  • {Escape(edit.PackageId)}: {Escape(edit.OldVersion)} → {Escape(edit.TargetVersion)}{major}{forced}");
             }
             lines.Add("");
         }
