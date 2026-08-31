@@ -9,9 +9,11 @@ A keyboard-driven .NET 10 app for reviewing and applying NuGet package updates a
 1. Finds `.sln`, `.slnx`, and standalone `.csproj` files inside Git repositories.
 2. Lets you select projects, ignore packages you do not want to touch, and persistently force selected packages to exact versions.
 3. Groups direct and centrally managed packages by package ID.
-4. Resolves package targets concurrently using a processor-aware worker count (between two and eight), then offers minor or major upgrades with major updates clearly marked.
+4. Resolves package targets concurrently using a processor-aware worker count (between two and eight), then offers minor, major, manual, or validated incremental upgrades.
 5. Preflights every repository and shows the exact package and Git plan.
 6. Applies approved updates one repository at a time, then restores, builds, and tests.
+
+The **Validated incremental** strategy first proves that each prepared repository restores, builds, and tests without package changes. It then updates Microsoft first-party packages (`Microsoft.*`, `Azure.*`, and `System.*`) together and validates them, followed by third-party packages one at a time. A third-party major update that fails is rolled back and retried at the latest minor version; if that also fails, the original working version is restored and the package failure is included in the final report. Progress identifies the active package, restore/build/test phase, failed packages, and failed repositories.
 
 You decide whether to stay on the current branch, sync from a base branch, create an update branch, and commit or push successful changes. Nothing is modified before the final approval.
 

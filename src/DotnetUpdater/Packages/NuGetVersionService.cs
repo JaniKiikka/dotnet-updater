@@ -136,24 +136,47 @@ public sealed class NuGetVersionService
         var occurrences = source.ToImmutableArray();
         var supported = occurrences.Where(x => x.UnsupportedReason is null && SemanticVersion.TryParse(x.CurrentVersion, out _)).ToArray();
         if (supported.Length == 0) return new(source.Key, occurrences, null, null, "No supported literal versions.");
-        var baseline = supported.MaxBy(x => { SemanticVersion.TryParse(x.CurrentVersion, out var v); return v.Major; })!;
+        var baselines = supported
+            .GroupBy(x => { SemanticVersion.TryParse(x.CurrentVersion, out var version); return version.Major; })
+            .ToDictionary(x => x.Key, x => x.First());
+        var baseline = baselines.OrderByDescending(x => x.Key).First().Value;
         try
         {
-            var minor = await LookupAsync(baseline.ProjectPath, source.Key, true, cancellationToken);
+            var minorLookups = new List<(int Key, PackageVersions Result)>();
+            foreach (var item in baselines)
+            {
+                var result = await LookupAsync(item.Value.ProjectPath, source.Key, true, cancellationToken)
+                    .ConfigureAwait(false);
+                minorLookups.Add((item.Key, result));
+            }
             var major = await LookupAsync(baseline.ProjectPath, source.Key, false, cancellationToken);
             SemanticVersion.TryParse(baseline.CurrentVersion, out var current);
-            var minorTarget = minor.Latest ?? current;
+            var minorTargets = minorLookups.ToImmutableDictionary(
+                x => x.Key,
+                x => x.Result.Latest is { } latest && latest.Major == x.Key
+                    ? latest
+                    : ParseCurrent(baselines[x.Key].CurrentVersion));
+            var minorTarget = minorTargets.GetValueOrDefault(current.Major, current);
             var maxCurrent = supported.Select(x => { SemanticVersion.TryParse(x.CurrentVersion, out var v); return v; }).Max();
             var majorTarget = major.Latest ?? maxCurrent;
-            return new(source.Key, occurrences,
+            return new PackageGroup(source.Key, occurrences,
                 minorTarget.Major == current.Major ? minorTarget : current,
                 majorTarget.CompareTo(maxCurrent) >= 0 ? majorTarget : maxCurrent,
-                minor.Error ?? major.Error);
+                minorLookups.Select(x => x.Result.Error).FirstOrDefault(x => x is not null) ?? major.Error)
+            {
+                LatestMinorByMajor = minorTargets
+            };
         }
         catch (Exception ex) when (ex is IOException or JsonException)
         {
             return new(source.Key, occurrences, null, null, ex.Message);
         }
+    }
+
+    private static SemanticVersion ParseCurrent(string value)
+    {
+        SemanticVersion.TryParse(value, out var version);
+        return version;
     }
 
     private Task<PackageVersions> LookupAsync(string project, string packageId, bool highestMinor, CancellationToken cancellationToken) =>

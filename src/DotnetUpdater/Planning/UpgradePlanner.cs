@@ -5,6 +5,8 @@ namespace DotnetUpdater.Planning;
 
 public sealed class UpgradePlanner
 {
+    private static readonly string[] FirstPartyPrefixes = ["Microsoft.", "Azure.", "System."];
+
     public UpgradePlan Create(
         IEnumerable<SelectionEntry> selectedEntries,
         IEnumerable<PackageGroup> groups,
@@ -40,13 +42,7 @@ public sealed class UpgradePlanner
             }
         }
 
-        var uniqueEdits = edits.GroupBy(x => (Path: NormalizePath(x.DeclarationPath), x.Locator), EditKeyComparer.Instance)
-            .Select(group =>
-            {
-                var targets = group.Select(x => x.TargetVersion).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-                if (targets.Length != 1) throw new InvalidOperationException($"Shared declaration {group.Key.Path} has conflicting targets.");
-                return group.First();
-            }).ToArray();
+        var uniqueEdits = UniqueEdits(edits);
 
         var repositories = selected.GroupBy(x => x.RepositoryRoot, PathComparer)
             .OrderBy(x => x.Key, PathComparer)
@@ -61,6 +57,67 @@ public sealed class UpgradePlanner
         return new(git, repositories, createdAt);
     }
 
+    public UpgradePlan CreateValidatedIncremental(
+        IEnumerable<SelectionEntry> selectedEntries,
+        IEnumerable<PackageGroup> groups,
+        IReadOnlyDictionary<string, string> forcedVersions,
+        GitWorkflowOptions git,
+        DateTimeOffset createdAt)
+    {
+        var selected = selectedEntries.ToArray();
+        var packageGroups = groups.ToArray();
+        var preferredDecisions = new Dictionary<string, PackageDecision>(StringComparer.OrdinalIgnoreCase);
+        var fallbackDecisions = new Dictionary<string, PackageDecision>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in packageGroups)
+        {
+            if (forcedVersions.TryGetValue(group.PackageId, out var forcedVersion))
+            {
+                preferredDecisions[group.PackageId] = new(
+                    group.PackageId,
+                    UpgradeChoice.ExactVersion,
+                    forcedVersion);
+                continue;
+            }
+
+            preferredDecisions[group.PackageId] = AutomaticDecision(group, UpgradeChoice.LatestMajor);
+            fallbackDecisions[group.PackageId] = AutomaticDecision(group, UpgradeChoice.LatestMinor);
+        }
+
+        var preferred = Create(selected, packageGroups, preferredDecisions, git, createdAt);
+        var fallbackByRepository = CreateValidatedFallbackEdits(selected, packageGroups, fallbackDecisions)
+            .GroupBy(x => x.RepositoryRoot, PathComparer)
+            .ToDictionary(x => x.Key, x => x.ToImmutableArray(), PathComparer);
+
+        var repositories = preferred.Repositories.Select(repository =>
+        {
+            var fallbackEdits = fallbackByRepository.GetValueOrDefault(repository.RepositoryRoot, []);
+            var updates = repository.Edits
+                .GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase)
+                .Select(group =>
+                {
+                    var packageId = group.First().PackageId;
+                    return new ValidatedPackageUpdate(
+                        packageId,
+                        IsMicrosoftFirstParty(packageId),
+                        group.Any(x => x.IsForced),
+                        group.ToImmutableArray(),
+                        fallbackEdits.Where(x => string.Equals(x.PackageId, packageId, StringComparison.OrdinalIgnoreCase))
+                            .ToImmutableArray());
+                })
+                .OrderByDescending(x => x.IsFirstParty)
+                .ThenBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase)
+                .ToImmutableArray();
+            return repository with { ValidatedUpdates = updates };
+        }).ToImmutableArray();
+
+        return preferred with
+        {
+            Repositories = repositories,
+            Strategy = UpgradeStrategy.ValidatedIncremental
+        };
+    }
+
     public static PackageDecision AutomaticDecision(PackageGroup group, UpgradeChoice choice)
     {
         var target = choice switch
@@ -71,6 +128,48 @@ public sealed class UpgradePlanner
         };
         return new(group.PackageId, target is null ? UpgradeChoice.NoUpdate : choice, target);
     }
+
+    public static bool IsMicrosoftFirstParty(string packageId) =>
+        FirstPartyPrefixes.Any(prefix => packageId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+
+    private static DeclarationEdit[] CreateValidatedFallbackEdits(
+        SelectionEntry[] selected,
+        IEnumerable<PackageGroup> groups,
+        IReadOnlyDictionary<string, PackageDecision> fallbackDecisions)
+    {
+        var edits = new List<DeclarationEdit>();
+        foreach (var group in groups)
+        {
+            if (!fallbackDecisions.TryGetValue(group.PackageId, out var decision) ||
+                decision.Choice == UpgradeChoice.NoUpdate) continue;
+
+            foreach (var occurrence in group.Occurrences.Where(x => x.UnsupportedReason is null))
+            {
+                if (!SemanticVersion.TryParse(occurrence.CurrentVersion, out var current)) continue;
+                SemanticVersion? target = group.LatestMinorByMajor.TryGetValue(current.Major, out var resolvedMinor)
+                    ? resolvedMinor
+                    : current.Major == group.HighestCurrentMajor ? group.LatestMinor : null;
+                if (target is null || target.Value.CompareTo(current) <= 0) continue;
+                var repository = selected.FirstOrDefault(x =>
+                    x.ProjectPaths.Contains(occurrence.ProjectPath, PathComparer))?.RepositoryRoot;
+                if (repository is null) continue;
+                edits.Add(new(repository, occurrence.Declaration.Path, occurrence.PackageId,
+                    occurrence.CurrentVersion, target.Value.ToString(), occurrence.Declaration.Kind,
+                    occurrence.Declaration.Locator));
+            }
+        }
+        return UniqueEdits(edits);
+    }
+
+    private static DeclarationEdit[] UniqueEdits(IEnumerable<DeclarationEdit> edits) => edits
+        .GroupBy(x => (Path: NormalizePath(x.DeclarationPath), x.Locator), EditKeyComparer.Instance)
+        .Select(group =>
+        {
+            var targets = group.Select(x => x.TargetVersion).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (targets.Length != 1)
+                throw new InvalidOperationException($"Shared declaration {group.Key.Path} has conflicting targets.");
+            return group.First();
+        }).ToArray();
 
     private static string NormalizePath(string path) => Path.GetFullPath(path);
     private static string? NormalizeBranch(string? branch) => string.IsNullOrWhiteSpace(branch) ? null : branch.Trim();

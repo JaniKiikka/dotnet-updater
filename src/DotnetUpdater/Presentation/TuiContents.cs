@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using DotnetUpdater.Configuration;
 using DotnetUpdater.Domain;
+using SharpConsoleUI;
 using SharpConsoleUI.Builders;
 using SharpConsoleUI.Controls;
 using SharpConsoleUI.Flows;
@@ -113,17 +114,104 @@ internal sealed class ChoiceListContent<T> : IFlowStepContent<T> where T : class
 
 internal sealed record ManualDecisionSelection(ImmutableArray<PackageDecision> Decisions);
 
-internal enum PackageRulesActionKind { Save, SelectVersion }
+internal enum PackageRulesActionKind { Save }
 
-internal sealed record PackageRulesAction(PackageRulesActionKind Kind, PackageRuleViewModel? Package = null);
+internal sealed record PackageRulesAction(PackageRulesActionKind Kind);
+
+internal enum PackageRuleDialogAction { Close, ToggleUpdatesEnabled, SelectVersion, ClearRule }
+
+internal sealed class PackageRuleDialogContent : IFlowStepContent<PackageRuleDialogAction>
+{
+    private readonly TaskCompletionSource<PackageRuleDialogAction> completion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly PackageRuleViewModel package;
+
+    public PackageRuleDialogContent(PackageRuleViewModel package) => this.package = package;
+
+    public Task<PackageRuleDialogAction> Completion => completion.Task;
+    public event Action? StateChanged;
+
+    public IWindowControl BuildContent(FlowChrome chrome)
+    {
+        var updatesEnabled = package.State != PackageRuleState.Ignored;
+        var toggleLabel = updatesEnabled ? "Disable updates" : "Enable updates";
+        var currentRule = package.State switch
+        {
+            PackageRuleState.Ignored => "updates disabled",
+            PackageRuleState.Forced => $"forced to {package.ForcedVersion}",
+            _ => "updates enabled"
+        };
+
+        var actions = new[]
+        {
+            new ListItem(toggleLabel) { Tag = PackageRuleDialogAction.ToggleUpdatesEnabled },
+            new ListItem("Force selected version") { Tag = PackageRuleDialogAction.SelectVersion },
+            new ListItem("Clear selected rule") { Tag = PackageRuleDialogAction.ClearRule },
+            new ListItem("Close dialog") { Tag = PackageRuleDialogAction.Close }
+        };
+        Window? hookedWindow = null;
+        ListControl? list = null;
+
+        void CompleteSelected()
+        {
+            if (list?.SelectedItem?.Tag is PackageRuleDialogAction action)
+                completion.TrySetResult(action);
+        }
+
+        void HandlePreviewKeyPressed(object? sender, KeyPressedEventArgs args)
+        {
+            if (!args.AlreadyHandled && list?.HasFocus == true && args.KeyInfo.Key == ConsoleKey.Spacebar)
+            {
+                args.Handled = true;
+                CompleteSelected();
+            }
+        }
+
+        list = Ctl.List("Choose an action")
+            .AddItems(actions)
+            .WithVerticalAlignment(VerticalAlignment.Fill)
+            .OnItemActivated((_, _) => CompleteSelected())
+            .OnGotFocus((_, _, window) =>
+            {
+                if (ReferenceEquals(hookedWindow, window)) return;
+                hookedWindow = window;
+                window.PreviewKeyPressed += HandlePreviewKeyPressed;
+            })
+            .OnLostFocus((_, _, window) =>
+            {
+                window.PreviewKeyPressed -= HandlePreviewKeyPressed;
+                if (ReferenceEquals(hookedWindow, window)) hookedWindow = null;
+            })
+            .Build();
+        list.MouseClick += (_, _) => CompleteSelected();
+
+        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        panel.AddControl(Ctl.Markup()
+            .AddLine($"[bold]{PresentationText.Escape(package.PackageId)}[/]")
+            .AddLine($"[dim]Current rule: {PresentationText.Escape(currentRule)}[/]")
+            .WithMargin(1)
+            .Build());
+        panel.AddControl(list);
+        panel.AddControl(Ctl.Markup("[dim]↑/↓ selects · Click / Space / Enter confirms · Esc closes[/]").Build());
+        StateChanged?.Invoke();
+        return panel;
+    }
+}
 
 internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
 {
     private readonly TaskCompletionSource<PackageRulesAction?> completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly PackageRulesViewModel viewModel;
+    private readonly Func<PackageRuleViewModel, Window, Task> editPackage;
 
-    public PackageRulesContent(PackageRulesViewModel viewModel) => this.viewModel = viewModel;
+    public PackageRulesContent(
+        PackageRulesViewModel viewModel,
+        Func<PackageRuleViewModel, Window, Task> editPackage)
+    {
+        this.viewModel = viewModel;
+        this.editPackage = editPackage;
+    }
 
     public Task<PackageRulesAction?> Completion => completion.Task;
     public event Action? StateChanged;
@@ -132,62 +220,88 @@ internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
     {
         var status = Ctl.Markup().Build();
         var items = viewModel.Items.Select(package => new ListItem(package.DisplayText) { Tag = package }).ToArray();
-        var list = Ctl.List("Package update rules")
-            .AddItems(items)
-            .WithVerticalAlignment(VerticalAlignment.Fill)
-            .Build();
+        Window? hookedWindow = null;
+        ListControl? list = null;
+        var editing = false;
 
-        void UpdateStatus()
+        async Task EditSelectedPackageAsync(Window window)
         {
-            var ignored = viewModel.Items.Count(x => x.State == PackageRuleState.Ignored);
-            var forced = viewModel.Items.Count(x => x.State == PackageRuleState.Forced);
-            status.SetContent([$"[dim]{ignored} ignored · {forced} forced to exact versions · ↑/↓ navigates · Tab reaches actions[/]"]);
-            StateChanged?.Invoke();
+            if (editing || list?.SelectedItem is not { Tag: PackageRuleViewModel package } item) return;
+            editing = true;
+            try
+            {
+                await editPackage(package, window).ConfigureAwait(true);
+                item.Text = package.DisplayText;
+                UpdateStatus();
+            }
+            catch (OperationCanceledException)
+            {
+                // Closing a nested dialog leaves the package-rules screen open.
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus(ex.Message);
+            }
+            finally
+            {
+                editing = false;
+            }
         }
 
-        void Refresh(ListItem item)
+        void HandlePreviewKeyPressed(object? sender, KeyPressedEventArgs args)
         {
-            item.Text = ((PackageRuleViewModel)item.Tag!).DisplayText;
-            UpdateStatus();
+            if (!args.AlreadyHandled && list?.HasFocus == true && args.KeyInfo.Key == ConsoleKey.Spacebar)
+            {
+                args.Handled = true;
+                if (hookedWindow is not null) _ = EditSelectedPackageAsync(hookedWindow);
+            }
+        }
+
+        list = Ctl.List("Package update rules")
+            .AddItems(items)
+            .WithVerticalAlignment(VerticalAlignment.Fill)
+            .OnItemActivated((_, _, window) => _ = EditSelectedPackageAsync(window))
+            .OnGotFocus((_, _, window) =>
+            {
+                if (ReferenceEquals(hookedWindow, window)) return;
+                hookedWindow = window;
+                window.PreviewKeyPressed += HandlePreviewKeyPressed;
+            })
+            .OnLostFocus((_, _, window) =>
+            {
+                window.PreviewKeyPressed -= HandlePreviewKeyPressed;
+                if (ReferenceEquals(hookedWindow, window)) hookedWindow = null;
+            })
+            .Build();
+        list.MouseClick += (_, args) =>
+        {
+            var window = args.SourceWindow ?? hookedWindow;
+            if (window is not null) _ = EditSelectedPackageAsync(window);
+        };
+
+        void UpdateStatus(string? error = null)
+        {
+            if (error is not null)
+            {
+                status.SetContent([$"[red]{PresentationText.Escape(error)}[/]"]);
+                StateChanged?.Invoke();
+                return;
+            }
+            var ignored = viewModel.Items.Count(x => x.State == PackageRuleState.Ignored);
+            var forced = viewModel.Items.Count(x => x.State == PackageRuleState.Forced);
+            status.SetContent([$"[dim]{ignored} ignored · {forced} forced to exact versions · Click / Space / Enter edits · ↑/↓ navigates[/]"]);
+            StateChanged?.Invoke();
         }
 
         var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
         panel.AddControl(Ctl.Markup()
-            .AddLine("[bold]Choose which packages are ignored and which are forced to exact versions.[/]")
+            .AddLine("[bold]Select a package to change its update rule.[/]")
             .AddLine("[dim][IGNORED] packages are skipped. [FORCED] packages are set to the shown version on every run, including downgrades and prereleases.[/]")
             .AddLine("[dim]Saved packages not found in this scan stay visible so their rules can be cleared.[/]")
             .WithMargin(1)
             .Build());
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Toggle ignored")
-            .OnClick((_, _) =>
-            {
-                if (list.SelectedItem is not { } item) return;
-                ((PackageRuleViewModel)item.Tag!).ToggleIgnored();
-                Refresh(item);
-            })
-            .Build());
-        panel.AddControl(Ctl.Button("Force selected version")
-            .OnClick((_, _) =>
-            {
-                if (list.SelectedItem?.Tag is not PackageRuleViewModel package) return;
-                if (!package.IsDiscovered)
-                {
-                    status.SetContent(["[yellow]This package is not currently discovered, so no effective NuGet source can be queried.[/]"]);
-                    return;
-                }
-                completion.TrySetResult(new(PackageRulesActionKind.SelectVersion, package));
-            })
-            .Build());
-        panel.AddControl(Ctl.Button("Clear selected rule")
-            .OnClick((_, _) =>
-            {
-                if (list.SelectedItem is not { } item) return;
-                ((PackageRuleViewModel)item.Tag!).Clear();
-                Refresh(item);
-            })
-            .Build());
         panel.AddControl(Ctl.Button("Save package rules")
             .OnClick((_, _) => completion.TrySetResult(new(PackageRulesActionKind.Save)))
             .Build());

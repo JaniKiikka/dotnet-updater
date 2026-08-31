@@ -10,6 +10,7 @@ public static class PresentationText
     {
         var lines = new List<string>
         {
+            $"[bold]Strategy:[/] {(plan.Strategy == UpgradeStrategy.ValidatedIncremental ? "Validated incremental" : "Batch update")}",
             $"[bold]Base:[/] {BaseDescription(plan.Git)}",
             $"[bold]Updates:[/] {TargetDescription(plan.Git)}",
             $"[bold]Delivery:[/] {(plan.Git.CommitAndPush ? $"Commit and push to {Escape(plan.Git.RemoteName)}" : "Leave changes uncommitted")}",
@@ -19,11 +20,41 @@ public static class PresentationText
         {
             lines.Add($"[bold cyan]{Escape(Path.GetFileName(repository.RepositoryRoot))}[/]");
             lines.Add($"[dim]{Escape(repository.RepositoryRoot)}[/]");
-            foreach (var edit in repository.Edits)
+            if (plan.Strategy == UpgradeStrategy.ValidatedIncremental)
             {
-                var major = IsMajor(edit) ? " [bold yellow]MAJOR[/]" : string.Empty;
-                var forced = edit.IsForced ? " [bold magenta]FORCED[/]" : string.Empty;
-                lines.Add($"  • {Escape(edit.PackageId)}: {Escape(edit.OldVersion)} → {Escape(edit.TargetVersion)}{major}{forced}");
+                lines.Add("  [bold]Baseline:[/] restore, build, and test before package edits");
+                var firstParty = repository.ValidatedUpdates.Where(x => x.IsFirstParty).ToArray();
+                if (firstParty.Length > 0)
+                    lines.Add($"  [bold]Microsoft first-party batch:[/] {string.Join(", ", firstParty.Select(x => Escape(x.PackageId)))}");
+                if (repository.ValidatedUpdates.Any(x => !x.IsFirstParty))
+                    lines.Add("  [bold]Third-party sequence:[/] latest major, then latest minor fallback when needed");
+            }
+            if (plan.Strategy == UpgradeStrategy.ValidatedIncremental)
+            {
+                foreach (var update in repository.ValidatedUpdates)
+                {
+                    var oldVersions = string.Join(", ", update.PreferredEdits.Select(x => x.OldVersion)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).Select(Escape));
+                    var preferredTargets = string.Join(", ", update.PreferredEdits.Select(x => x.TargetVersion)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).Select(Escape));
+                    var forced = update.IsForced ? " [bold magenta]FORCED[/]" : " [bold yellow]LATEST FIRST[/]";
+                    lines.Add($"  • {Escape(update.PackageId)}: {oldVersions} → {preferredTargets}{forced}");
+                    if (update.FallbackEdits.Length > 0)
+                    {
+                        var fallbackTargets = string.Join(", ", update.FallbackEdits.Select(x => x.TargetVersion)
+                            .Distinct(StringComparer.OrdinalIgnoreCase).Select(Escape));
+                        lines.Add($"    [dim]fallback → {fallbackTargets}[/]");
+                    }
+                }
+            }
+            else
+            {
+                foreach (var edit in repository.Edits)
+                {
+                    var major = IsMajor(edit) ? " [bold yellow]MAJOR[/]" : string.Empty;
+                    var forced = edit.IsForced ? " [bold magenta]FORCED[/]" : string.Empty;
+                    lines.Add($"  • {Escape(edit.PackageId)}: {Escape(edit.OldVersion)} → {Escape(edit.TargetVersion)}{major}{forced}");
+                }
             }
             lines.Add("");
         }
@@ -86,6 +117,10 @@ public static class PresentationText
             if (result.RemoteBranch is not null) lines.Add($"  Remote: {Escape(result.RemoteBranch)}");
             foreach (var package in result.ChangedPackages)
                 lines.Add($"  • {Escape(package.PackageId)}: {Escape(package.OldVersion)} → {Escape(package.TargetVersion)}");
+            foreach (var package in result.PackageResults.Where(x => x.Status == PackageUpdateStatus.Failed))
+                lines.Add($"  [red]✗ Package not updated: {Escape(package.PackageId)} — {Escape(package.Message)}[/]");
+            foreach (var package in result.PackageResults.Where(x => x.Status == PackageUpdateStatus.UpdatedWithFallback))
+                lines.Add($"  [yellow]↳ Minor fallback: {Escape(package.PackageId)} → {Escape(package.TargetVersion ?? "unknown")}[/]");
             if (result.Message is not null) lines.Add($"  {Escape(result.Message)}");
             lines.Add($"  Log: {Escape(result.LogPath)}");
             lines.Add("");

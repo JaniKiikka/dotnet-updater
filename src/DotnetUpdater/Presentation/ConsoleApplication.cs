@@ -265,6 +265,7 @@ public sealed class ConsoleApplication(
                 [
                     ("Latest minor", "stay within the highest major already selected", new(UpgradeMode.LatestMinor, "Latest minor", "")),
                     ("Latest major", "allow breaking changes; the review marks every major jump", new(UpgradeMode.LatestMajor, "Latest major", "")),
+                    ("Validated incremental", "baseline-check, update Microsoft packages together, then validate third-party packages one by one", new(UpgradeMode.ValidatedIncremental, "Validated incremental", "")),
                     ("Select packages", "cycle an action independently for each package", new(UpgradeMode.SelectPackages, "Select packages", ""))
                 ]),
             cancellationToken,
@@ -280,7 +281,7 @@ public sealed class ConsoleApplication(
             foreach (var forced in forcedVersions.Where(x => decisions.ContainsKey(x.Key)))
                 decisions[forced.Key] = new(forced.Key, UpgradeChoice.ExactVersion, forced.Value);
         }
-        else
+        else if (mode.Mode == UpgradeMode.SelectPackages)
         {
             var manual = await PresentAsync(
                 windowSystem,
@@ -295,12 +296,19 @@ public sealed class ConsoleApplication(
         }
 
         var gitWorkflow = await ReadGitWorkflowAsync(context, configuration).ConfigureAwait(false);
-        var plan = planner.Create(
-            selected,
-            resolved,
-            decisions,
-            gitWorkflow,
-            DateTimeOffset.UtcNow);
+        var plan = mode.Mode == UpgradeMode.ValidatedIncremental
+            ? planner.CreateValidatedIncremental(
+                selected,
+                resolved,
+                forcedVersions,
+                gitWorkflow,
+                DateTimeOffset.UtcNow)
+            : planner.Create(
+                selected,
+                resolved,
+                decisions,
+                gitWorkflow,
+                DateTimeOffset.UtcNow);
         if (plan.Repositories.Length == 0)
         {
             await ShowMessageAsync(windowSystem, parent, "Nothing to update",
@@ -448,29 +456,41 @@ public sealed class ConsoleApplication(
             result.Occurrences,
             configuration.IgnoredPackages,
             configuration.ForcedPackageVersions);
-        while (true)
+
+        async Task EditPackageAsync(PackageRuleViewModel package, Window rulesWindow)
         {
-            var action = await PresentAsync(
+            var ruleAction = await PresentAsync(
                 windowSystem,
-                parent,
-                "Package update rules",
-                new PackageRulesContent(viewModel),
+                rulesWindow,
+                $"Package rule: {package.PackageId}",
+                new PackageRuleDialogContent(package),
                 cancellationToken,
-                width: 110,
-                height: 34).ConfigureAwait(false);
-            if (action is null) return configuration;
-            if (action.Kind == PackageRulesActionKind.Save)
+                width: 64,
+                height: 16).ConfigureAwait(true);
+            if (ruleAction == PackageRuleDialogAction.Close) return;
+            if (ruleAction == PackageRuleDialogAction.ToggleUpdatesEnabled)
             {
-                var updated = configuration with
-                {
-                    IgnoredPackages = viewModel.IgnoredPackages,
-                    ForcedPackageVersions = viewModel.ForcedVersions
-                };
-                await configurationStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
-                return updated;
+                package.ToggleIgnored();
+                return;
+            }
+            if (ruleAction == PackageRuleDialogAction.ClearRule)
+            {
+                package.Clear();
+                return;
+            }
+            if (!package.IsDiscovered)
+            {
+                await ShowMessageAsync(
+                    windowSystem,
+                    rulesWindow,
+                    "Package versions unavailable",
+                    "This package is not currently discovered, so no effective NuGet source can be queried.",
+                    cancellationToken,
+                    width: 76,
+                    height: 14).ConfigureAwait(true);
+                return;
             }
 
-            var package = action.Package!;
             var lookup = await context.RunWithProgress(
                 "Loading package versions",
                 $"Querying configured NuGet sources for every {package.PackageId} version…",
@@ -484,23 +504,41 @@ public sealed class ConsoleApplication(
                 var message = lookup.Error ?? "The configured NuGet sources returned no versions for this package.";
                 await ShowMessageAsync(
                     windowSystem,
-                    parent,
+                    rulesWindow,
                     "Package versions unavailable",
                     PresentationText.Escape(message),
-                    cancellationToken).ConfigureAwait(false);
-                continue;
+                    cancellationToken).ConfigureAwait(true);
+                return;
             }
 
             var selection = await PresentAsync(
                 windowSystem,
-                parent,
+                rulesWindow,
                 $"Select {package.PackageId} version",
                 new PackageVersionSelectionContent(package.PackageId, lookup.Versions),
                 cancellationToken,
                 width: 92,
-                height: 32).ConfigureAwait(false);
+                height: 32).ConfigureAwait(true);
             if (selection is not null) package.Force(selection.Version);
         }
+
+        var action = await PresentAsync(
+            windowSystem,
+            parent,
+            "Package update rules",
+            new PackageRulesContent(viewModel, EditPackageAsync),
+            cancellationToken,
+            width: 110,
+            height: 34).ConfigureAwait(false);
+        if (action is null) return configuration;
+
+        var updated = configuration with
+        {
+            IgnoredPackages = viewModel.IgnoredPackages,
+            ForcedPackageVersions = viewModel.ForcedVersions
+        };
+        await configurationStore.SaveAsync(updated, cancellationToken).ConfigureAwait(false);
+        return updated;
     }
 
     private static async Task<GitWorkflowOptions> ReadGitWorkflowAsync(

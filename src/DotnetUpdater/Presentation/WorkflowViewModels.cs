@@ -9,6 +9,7 @@ public enum UpgradeMode
 {
     LatestMinor,
     LatestMajor,
+    ValidatedIncremental,
     SelectPackages
 }
 

@@ -47,6 +47,9 @@ public sealed record PackageGroup(
     SemanticVersion? LatestMajor,
     string? ResolutionError)
 {
+    public ImmutableDictionary<int, SemanticVersion> LatestMinorByMajor { get; init; } =
+        ImmutableDictionary<int, SemanticVersion>.Empty;
+
     public int HighestCurrentMajor => Occurrences
         .Select(x => SemanticVersion.TryParse(x.CurrentVersion, out var version) ? version.Major : 0)
         .DefaultIfEmpty(0).Max();
@@ -69,7 +72,17 @@ public sealed record DeclarationEdit(
 public sealed record RepositoryPlan(
     string RepositoryRoot,
     ImmutableArray<string> ValidationTargets,
-    ImmutableArray<DeclarationEdit> Edits);
+    ImmutableArray<DeclarationEdit> Edits)
+{
+    public ImmutableArray<ValidatedPackageUpdate> ValidatedUpdates { get; init; } = [];
+}
+
+public sealed record ValidatedPackageUpdate(
+    string PackageId,
+    bool IsFirstParty,
+    bool IsForced,
+    ImmutableArray<DeclarationEdit> PreferredEdits,
+    ImmutableArray<DeclarationEdit> FallbackEdits);
 
 public sealed record GitWorkflowOptions(
     string RemoteName,
@@ -83,7 +96,12 @@ public sealed record GitWorkflowOptions(
 public sealed record UpgradePlan(
     GitWorkflowOptions Git,
     ImmutableArray<RepositoryPlan> Repositories,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt)
+{
+    public UpgradeStrategy Strategy { get; init; } = UpgradeStrategy.Batch;
+}
+
+public enum UpgradeStrategy { Batch, ValidatedIncremental }
 
 public enum RunStage
 {
@@ -127,9 +145,17 @@ public sealed record RepositoryPreflight(
     bool IsReady,
     ImmutableArray<PreflightIssue> Issues);
 
-public sealed record ProgressEvent(string RepositoryRoot, RunStage Stage, string Message);
+public sealed record ProgressEvent(string RepositoryRoot, RunStage Stage, string Message, string? PackageId = null);
 
 public sealed record ChangedPackage(string PackageId, string OldVersion, string TargetVersion);
+
+public enum PackageUpdateStatus { Updated, UpdatedWithFallback, Failed }
+
+public sealed record PackageUpdateResult(
+    string PackageId,
+    PackageUpdateStatus Status,
+    string? TargetVersion,
+    string Message);
 
 public sealed record RepositoryRunResult(
     string RepositoryRoot,
@@ -141,7 +167,10 @@ public sealed record RepositoryRunResult(
     string? RemoteBranch,
     ImmutableArray<ChangedPackage> ChangedPackages,
     string LogPath,
-    string? Message);
+    string? Message)
+{
+    public ImmutableArray<PackageUpdateResult> PackageResults { get; init; } = [];
+}
 
 public readonly record struct SemanticVersion(int Major, int Minor, int Patch, string? Suffix = null)
     : IComparable<SemanticVersion>

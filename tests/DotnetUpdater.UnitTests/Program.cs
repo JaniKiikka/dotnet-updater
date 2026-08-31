@@ -50,6 +50,34 @@ public sealed class NuGetVersionServiceTests
     }
 
     [TestMethod]
+    public async Task ResolveKeepsLatestMinorTargetForEveryWorkingMajor()
+    {
+        using var temp = new TempDirectory();
+        var projectOne = Path.Combine(temp.Path, "One.csproj");
+        var projectTwo = Path.Combine(temp.Path, "Two.csproj");
+        var occurrences = new[]
+        {
+            Occurrence(projectOne, "1.2.0"),
+            Occurrence(projectTwo, "2.3.0")
+        };
+        var group = occurrences.GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase).Single();
+        var runner = new RecordingRunner(request =>
+        {
+            var isMinor = request.Arguments.Contains("--highest-minor");
+            var version = !isMinor ? "3.0.0"
+                : request.Arguments.Contains(projectOne) ? "1.9.0" : "2.8.0";
+            return new(0, $$"""{"id":"Example.Package","latestVersion":"{{version}}"}""", string.Empty);
+        });
+
+        var resolved = await new NuGetVersionService(runner).ResolveAsync(group, default);
+
+        Assert.AreEqual(new SemanticVersion(1, 9, 0), resolved.LatestMinorByMajor[1]);
+        Assert.AreEqual(new SemanticVersion(2, 8, 0), resolved.LatestMinorByMajor[2]);
+        Assert.AreEqual(new SemanticVersion(2, 8, 0), resolved.LatestMinor);
+        Assert.AreEqual(new SemanticVersion(3, 0, 0), resolved.LatestMajor);
+    }
+
+    [TestMethod]
     public async Task ExactVersionLookupReturnsEveryStableAndPrereleaseVersion()
     {
         var source = new RecordingAllVersionsSource(
@@ -111,6 +139,11 @@ public sealed class NuGetVersionServiceTests
             </package>
             """);
     }
+
+    private static PackageOccurrence Occurrence(string project, string version) =>
+        new("Example.Package", version, project,
+            new(project, "Example.Package", version, DeclarationKind.PackageReferenceAttribute,
+                "PackageReference:Example.Package:attribute"));
 }
 
 [TestClass]
@@ -341,6 +374,75 @@ public sealed class UpgradePlannerTests
         Assert.AreEqual("2.0.0-rc.1", edit.TargetVersion);
         Assert.IsTrue(edit.IsForced);
     }
+
+    [TestMethod]
+    public void ValidatedIncrementalPlanSeparatesMicrosoftPackagesAndKeepsMinorFallbacks()
+    {
+        using var temp = new TempDirectory();
+        var project = Path.Combine(temp.Path, "App.csproj");
+        var microsoft = Occurrence(project, "Microsoft.Extensions.Example", "1.0.0");
+        var thirdParty = Occurrence(project, "Serilog", "3.0.0");
+        var groups = new[]
+        {
+            new PackageGroup(microsoft.PackageId, [microsoft], new(1, 8, 0), new(2, 0, 0), null),
+            new PackageGroup(thirdParty.PackageId, [thirdParty], new(3, 4, 0), new(4, 0, 0), null)
+        };
+        var entry = new SelectionEntry(project, temp.Path, EntryKind.StandaloneProject, [project]);
+
+        var plan = new UpgradePlanner().CreateValidatedIncremental(
+            [entry], groups, new Dictionary<string, string>(),
+            new("origin", null, null, false), DateTimeOffset.UnixEpoch);
+
+        Assert.AreEqual(UpgradeStrategy.ValidatedIncremental, plan.Strategy);
+        var updates = plan.Repositories.Single().ValidatedUpdates;
+        Assert.IsTrue(updates.Single(x => x.PackageId == microsoft.PackageId).IsFirstParty);
+        var serilog = updates.Single(x => x.PackageId == thirdParty.PackageId);
+        Assert.IsFalse(serilog.IsFirstParty);
+        Assert.AreEqual("4.0.0", serilog.PreferredEdits.Single().TargetVersion);
+        Assert.AreEqual("3.4.0", serilog.FallbackEdits.Single().TargetVersion);
+    }
+
+    [TestMethod]
+    public void ValidatedIncrementalFallbackStaysOnEachRepositoriesWorkingMajor()
+    {
+        using var temp = new TempDirectory();
+        var repoOne = Directory.CreateDirectory(Path.Combine(temp.Path, "one")).FullName;
+        var repoTwo = Directory.CreateDirectory(Path.Combine(temp.Path, "two")).FullName;
+        var projectOne = Path.Combine(repoOne, "One.csproj");
+        var projectTwo = Path.Combine(repoTwo, "Two.csproj");
+        var group = new PackageGroup(
+            "Example.Package",
+            [Occurrence(projectOne, "Example.Package", "1.2.0"), Occurrence(projectTwo, "Example.Package", "2.3.0")],
+            new(2, 8, 0),
+            new(3, 0, 0),
+            null)
+        {
+            LatestMinorByMajor = new Dictionary<int, SemanticVersion>
+            {
+                [1] = new(1, 9, 0),
+                [2] = new(2, 8, 0)
+            }.ToImmutableDictionary()
+        };
+        var entries = new[]
+        {
+            new SelectionEntry(projectOne, repoOne, EntryKind.StandaloneProject, [projectOne]),
+            new SelectionEntry(projectTwo, repoTwo, EntryKind.StandaloneProject, [projectTwo])
+        };
+
+        var plan = new UpgradePlanner().CreateValidatedIncremental(
+            entries, [group], new Dictionary<string, string>(),
+            new("origin", null, null, false), DateTimeOffset.UnixEpoch);
+
+        Assert.AreEqual("1.9.0", plan.Repositories.Single(x => x.RepositoryRoot == repoOne)
+            .ValidatedUpdates.Single().FallbackEdits.Single().TargetVersion);
+        Assert.AreEqual("2.8.0", plan.Repositories.Single(x => x.RepositoryRoot == repoTwo)
+            .ValidatedUpdates.Single().FallbackEdits.Single().TargetVersion);
+    }
+
+    private static PackageOccurrence Occurrence(string project, string packageId, string version) =>
+        new(packageId, version, project,
+            new(project, packageId, version, DeclarationKind.PackageReferenceAttribute,
+                $"PackageReference:{packageId}:attribute"));
 }
 
 [TestClass]
@@ -500,6 +602,116 @@ public sealed class RunCoordinatorTests
             $"dotnet test {target} --no-build --no-restore"
         }, fake.Requests.Select(request => $"{request.FileName} {string.Join(' ', request.Arguments)}").ToArray());
     }
+
+    [TestMethod]
+    public async Task ValidatedIncrementalBuildsBaselineThenUsesMinorFallback()
+    {
+        using var temp = new TempDirectory();
+        var project = Path.Combine(temp.Path, "App.csproj");
+        File.WriteAllText(project, """
+            <Project><ItemGroup>
+              <PackageReference Include="Microsoft.Extensions.Example" Version="1.0.0" />
+              <PackageReference Include="Third.Party" Version="1.0.0" />
+            </ItemGroup></Project>
+            """);
+        var microsoftEdit = Edit(temp.Path, project, "Microsoft.Extensions.Example", "1.0.0", "2.0.0");
+        var thirdMajor = Edit(temp.Path, project, "Third.Party", "1.0.0", "2.0.0");
+        var thirdMinor = Edit(temp.Path, project, "Third.Party", "1.0.0", "1.5.0");
+        var repository = new RepositoryPlan(temp.Path, [project], [microsoftEdit, thirdMajor])
+        {
+            ValidatedUpdates =
+            [
+                new("Microsoft.Extensions.Example", true, false, [microsoftEdit], []),
+                new("Third.Party", false, false, [thirdMajor], [thirdMinor])
+            ]
+        };
+        var plan = new UpgradePlan(new("origin", null, null, false), [repository], DateTimeOffset.UnixEpoch)
+        {
+            Strategy = UpgradeStrategy.ValidatedIncremental
+        };
+        var fake = new RecordingRunner(request =>
+        {
+            if (request.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new(0, "work-in-progress\n", string.Empty);
+            if (request.FileName == "dotnet" && request.Arguments.FirstOrDefault() == "build" &&
+                File.ReadAllText(project).Contains("Third.Party\" Version=\"2.0.0", StringComparison.Ordinal))
+                return new(1, string.Empty, "major build failed");
+            return new(0, string.Empty, string.Empty);
+        });
+        var logger = new FileRunLogger(Path.Combine(temp.Path, "logs"));
+        var coordinator = new RunCoordinator(fake, new GitService(fake), new PackageEditor(), logger);
+        var ready = Ready(temp.Path);
+
+        var result = (await coordinator.ExecuteAsync(plan, ready, null, default)).Single();
+
+        Assert.AreEqual(RunStage.Passed, result.Status);
+        Assert.AreEqual(PackageUpdateStatus.UpdatedWithFallback,
+            result.PackageResults.Single(x => x.PackageId == "Third.Party").Status);
+        var final = File.ReadAllText(project);
+        StringAssert.Contains(final, "Microsoft.Extensions.Example\" Version=\"2.0.0");
+        StringAssert.Contains(final, "Third.Party\" Version=\"1.5.0");
+        Assert.HasCount(4, fake.Requests.Where(x => x.FileName == "dotnet" && x.Arguments.First() == "restore"));
+        Assert.HasCount(3, fake.Requests.Where(x => x.FileName == "dotnet" && x.Arguments.First() == "test"));
+    }
+
+    [TestMethod]
+    public async Task ValidatedIncrementalRestoresRejectedPackageAndContinues()
+    {
+        using var temp = new TempDirectory();
+        var project = Path.Combine(temp.Path, "App.csproj");
+        File.WriteAllText(project, """
+            <Project><ItemGroup>
+              <PackageReference Include="Broken.Package" Version="1.0.0" />
+              <PackageReference Include="Working.Package" Version="1.0.0" />
+            </ItemGroup></Project>
+            """);
+        var brokenMajor = Edit(temp.Path, project, "Broken.Package", "1.0.0", "2.0.0");
+        var brokenMinor = Edit(temp.Path, project, "Broken.Package", "1.0.0", "1.5.0");
+        var working = Edit(temp.Path, project, "Working.Package", "1.0.0", "2.0.0");
+        var repository = new RepositoryPlan(temp.Path, [project], [brokenMajor, working])
+        {
+            ValidatedUpdates =
+            [
+                new("Broken.Package", false, false, [brokenMajor], [brokenMinor]),
+                new("Working.Package", false, false, [working], [])
+            ]
+        };
+        var plan = new UpgradePlan(new("origin", null, null, false), [repository], DateTimeOffset.UnixEpoch)
+        {
+            Strategy = UpgradeStrategy.ValidatedIncremental
+        };
+        var fake = new RecordingRunner(request =>
+        {
+            if (request.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new(0, "work-in-progress\n", string.Empty);
+            if (request.FileName == "dotnet" && request.Arguments.FirstOrDefault() == "test" &&
+                !File.ReadAllText(project).Contains("Broken.Package\" Version=\"1.0.0", StringComparison.Ordinal))
+                return new(1, string.Empty, "tests failed");
+            return new(0, string.Empty, string.Empty);
+        });
+        var coordinator = new RunCoordinator(fake, new GitService(fake), new PackageEditor(),
+            new FileRunLogger(Path.Combine(temp.Path, "logs")));
+
+        var result = (await coordinator.ExecuteAsync(plan, Ready(temp.Path), null, default)).Single();
+
+        Assert.AreEqual(RunStage.Passed, result.Status);
+        Assert.AreEqual(PackageUpdateStatus.Failed,
+            result.PackageResults.Single(x => x.PackageId == "Broken.Package").Status);
+        var final = File.ReadAllText(project);
+        StringAssert.Contains(final, "Broken.Package\" Version=\"1.0.0");
+        StringAssert.Contains(final, "Working.Package\" Version=\"2.0.0");
+        Assert.IsFalse(result.ChangedPackages.Any(x => x.PackageId == "Broken.Package"));
+    }
+
+    private static DeclarationEdit Edit(string root, string project, string packageId, string oldVersion, string targetVersion) =>
+        new(root, project, packageId, oldVersion, targetVersion, DeclarationKind.PackageReferenceAttribute,
+            $"PackageReference:{packageId}:attribute");
+
+    private static Dictionary<string, RepositoryPreflight> Ready(string root) =>
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal)
+        {
+            [root] = new(root, true, [])
+        };
 }
 
 [TestClass]
