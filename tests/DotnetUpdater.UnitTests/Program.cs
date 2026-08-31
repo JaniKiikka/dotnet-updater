@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.IO.Compression;
+using System.Text.Json;
 using DotnetUpdater.Configuration;
 using DotnetUpdater.Discovery;
 using DotnetUpdater.Domain;
@@ -225,7 +226,7 @@ public sealed class ConfigurationStoreTests
         var path = Path.Combine(temp.Path, "settings.json");
         await File.WriteAllTextAsync(path, $$"""
             {
-              "projectsFolder": "{{temp.Path}}",
+              "projectsFolder": {{JsonSerializer.Serialize(temp.Path)}},
               "ignoredPackages": ["Serilog"],
               "developmentBranch": "development",
               "remoteName": "origin"
