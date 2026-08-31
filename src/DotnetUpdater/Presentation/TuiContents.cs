@@ -6,16 +6,72 @@ using SharpConsoleUI.Builders;
 using SharpConsoleUI.Controls;
 using SharpConsoleUI.Flows;
 using SharpConsoleUI.Layout;
+using SharpConsoleUI.Themes;
 using Ctl = SharpConsoleUI.Builders.Controls;
 
 namespace DotnetUpdater.Presentation;
 
 internal sealed record EntrySelection(ImmutableArray<SelectionEntry> Entries);
 
+internal static class TuiChrome
+{
+    private static readonly Color FocusedButtonForeground = new("#07111F");
+
+    public static IWindowControl View(IWindowControl body, params ButtonControl[] buttons) => Ctl.Grid()
+        .Columns([GridLength.Star()])
+        .Rows([GridLength.Star(), GridLength.Cells(1), GridLength.Auto()])
+        .Place(body, 0, 0)
+        .Place(Ctl.RuleBuilder().WithColorRole(ColorRole.Secondary).Build(), 1, 0)
+        .Place(ActionRow(buttons), 2, 0)
+        .WithAlignment(HorizontalAlignment.Stretch)
+        .WithVerticalAlignment(VerticalAlignment.Fill)
+        .Build();
+
+    private static HorizontalGridControl ActionRow(IEnumerable<ButtonControl> buttons)
+    {
+        var controls = buttons
+            .SelectMany(button => new IWindowControl[]
+                { button, Ctl.Markup("[dim]|[/]").Build() })
+            .SkipLast(1);
+        return HorizontalGridControl.FromControls(controls, HorizontalAlignment.Right);
+    }
+
+    public static ButtonControl Primary(string label, EventHandler<ButtonControl> onClick) =>
+        Ctl.Button(label)
+            .WithColorRole(ColorRole.Primary)
+            .Outline(true)
+            .WithFocusedColors(FocusedButtonForeground, new Color("#38BDF8"))
+            .OnClick(onClick)
+            .Build();
+
+    public static ButtonControl Secondary(string label, EventHandler<ButtonControl> onClick) =>
+        Ctl.Button(label)
+            .WithColorRole(ColorRole.Secondary)
+            .Outline(true)
+            .WithFocusedColors(FocusedButtonForeground, new Color("#818CF8"))
+            .OnClick(onClick)
+            .Build();
+
+    public static ButtonControl Danger(string label, EventHandler<ButtonControl> onClick) =>
+        Ctl.Button(label)
+            .WithColorRole(ColorRole.Danger)
+            .Outline(true)
+            .WithFocusedColors(FocusedButtonForeground, new Color("#FB7185"))
+            .OnClick(onClick)
+            .Build();
+
+    public static ScrollablePanelControl ScrollableBody() => Ctl.ScrollablePanel()
+        .WithVerticalAlignment(VerticalAlignment.Fill)
+        .WithScrollbar(true)
+        .WithMargin(1, 0, 1, 0)
+        .Build();
+}
+
 internal sealed class EntrySelectionContent : IFlowStepContent<EntrySelection>
 {
     private readonly TaskCompletionSource<EntrySelection?> completion = NewCompletion<EntrySelection>();
     private readonly ImmutableArray<SelectionEntry> entries;
+    private ListControl? list;
 
     public EntrySelectionContent(ImmutableArray<SelectionEntry> entries) => this.entries = entries;
 
@@ -26,12 +82,14 @@ internal sealed class EntrySelectionContent : IFlowStepContent<EntrySelection>
     {
         var status = Ctl.Markup().Build();
         var items = entries.Select(entry => new ListItem(
-            $"{entry.DisplayName}  ·  {Path.GetFileName(entry.RepositoryRoot)}  ·  {entry.ProjectPaths.Length} project(s)")
+            $"{entry.DisplayName}  ·  {Path.GetFileName(entry.RepositoryRoot)}  ·  {entry.ProjectPaths.Length} project(s)",
+            "◈",
+            new Color("#38BDF8"))
         {
             Tag = entry,
             IsChecked = true
         }).ToArray();
-        var list = Ctl.List("Solutions and standalone projects")
+        list = Ctl.List("Choose solutions and projects to upgrade")
             .AddItems(items)
             .WithCheckboxMode()
             .WithVerticalAlignment(VerticalAlignment.Fill)
@@ -45,20 +103,16 @@ internal sealed class EntrySelectionContent : IFlowStepContent<EntrySelection>
         }
 
         list.CheckedItemsChanged += (_, _) => UpdateStatus();
-        var panel = Ctl.ScrollablePanel()
-            .WithVerticalAlignment(VerticalAlignment.Fill)
-            .Build();
-        panel.AddControl(Ctl.Markup()
-            .AddLine("[bold]Choose everything that should share this upgrade plan.[/]")
-            .AddLine("[dim]Projects referenced by a selected solution are included automatically.[/]")
-            .WithMargin(1)
-            .Build());
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Select all").OnClick((_, _) => list.SetAllChecked(true)).Build());
-        panel.AddControl(Ctl.Button("Clear selection").OnClick((_, _) => list.SetAllChecked(false)).Build());
-        panel.AddControl(Ctl.Button("Continue")
-            .OnClick((_, _) =>
+        UpdateStatus();
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Secondary("Select all", (_, _) => list.SetAllChecked(true)),
+            TuiChrome.Secondary("Clear", (_, _) => list.SetAllChecked(false)),
+            TuiChrome.Danger("Cancel", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary("Continue", (_, _) =>
             {
                 var selected = list.GetCheckedItems()
                     .Select(x => (SelectionEntry)x.Tag!)
@@ -66,14 +120,11 @@ internal sealed class EntrySelectionContent : IFlowStepContent<EntrySelection>
                 if (selected.Length == 0)
                 {
                     status.SetContent(["[red]Select at least one entry before continuing.[/]"]);
+                    StateChanged?.Invoke();
                     return;
                 }
                 completion.TrySetResult(new EntrySelection(selected));
-            })
-            .Build());
-        panel.AddControl(Ctl.Button("Cancel").OnClick((_, _) => completion.TrySetCanceled()).Build());
-        UpdateStatus();
-        return panel;
+            }));
     }
 
     private static TaskCompletionSource<T?> NewCompletion<T>() where T : class =>
@@ -85,6 +136,7 @@ internal sealed class ChoiceListContent<T> : IFlowStepContent<T> where T : class
     private readonly TaskCompletionSource<T?> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string description;
     private readonly IReadOnlyList<(string Label, string Description, T Value)> choices;
+    private ListControl? list;
 
     public ChoiceListContent(string description, IReadOnlyList<(string Label, string Description, T Value)> choices)
     {
@@ -97,10 +149,16 @@ internal sealed class ChoiceListContent<T> : IFlowStepContent<T> where T : class
 
     public IWindowControl BuildContent(FlowChrome chrome)
     {
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup(PresentationText.Escape(description)).WithMargin(1).Build());
-        var items = choices.Select(choice => new ListItem($"{choice.Label} — {choice.Description}") { Tag = choice.Value });
-        var list = Ctl.List("Choose an option")
+        var items = choices.Select(choice => new ListItem(
+            $"{choice.Label} — {choice.Description}",
+            "◆",
+            new Color("#818CF8"))
+        {
+            Tag = choice.Value
+        });
+        list = Ctl.List("Choose an option")
             .AddItems(items)
             .WithVerticalAlignment(VerticalAlignment.Fill)
             .OnItemActivated((_, item) => completion.TrySetResult((T)item.Tag!))
@@ -108,7 +166,13 @@ internal sealed class ChoiceListContent<T> : IFlowStepContent<T> where T : class
         panel.AddControl(list);
         panel.AddControl(Ctl.Markup("[dim]↑/↓ selects · Enter confirms · Esc cancels[/]").Build());
         StateChanged?.Invoke();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Cancel", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary("Select", (_, _) =>
+            {
+                if (list.SelectedItem?.Tag is T value) completion.TrySetResult(value);
+            }));
     }
 }
 
@@ -133,8 +197,6 @@ internal sealed class PackageRuleDialogContent : IFlowStepContent<PackageRuleDia
 
     public IWindowControl BuildContent(FlowChrome chrome)
     {
-        var updatesEnabled = package.State != PackageRuleState.Ignored;
-        var toggleLabel = updatesEnabled ? "Disable updates" : "Enable updates";
         var currentRule = package.State switch
         {
             PackageRuleState.Ignored => "updates disabled",
@@ -142,59 +204,23 @@ internal sealed class PackageRuleDialogContent : IFlowStepContent<PackageRuleDia
             _ => "updates enabled"
         };
 
-        var actions = new[]
-        {
-            new ListItem(toggleLabel) { Tag = PackageRuleDialogAction.ToggleUpdatesEnabled },
-            new ListItem("Force selected version") { Tag = PackageRuleDialogAction.SelectVersion },
-            new ListItem("Clear selected rule") { Tag = PackageRuleDialogAction.ClearRule },
-            new ListItem("Close dialog") { Tag = PackageRuleDialogAction.Close }
-        };
-        Window? hookedWindow = null;
-        ListControl? list = null;
-
-        void CompleteSelected()
-        {
-            if (list?.SelectedItem?.Tag is PackageRuleDialogAction action)
-                completion.TrySetResult(action);
-        }
-
-        void HandlePreviewKeyPressed(object? sender, KeyPressedEventArgs args)
-        {
-            if (!args.AlreadyHandled && list?.HasFocus == true && args.KeyInfo.Key == ConsoleKey.Spacebar)
-            {
-                args.Handled = true;
-                CompleteSelected();
-            }
-        }
-
-        list = Ctl.List("Choose an action")
-            .AddItems(actions)
-            .WithVerticalAlignment(VerticalAlignment.Fill)
-            .OnItemActivated((_, _) => CompleteSelected())
-            .OnGotFocus((_, _, window) =>
-            {
-                if (ReferenceEquals(hookedWindow, window)) return;
-                hookedWindow = window;
-                window.PreviewKeyPressed += HandlePreviewKeyPressed;
-            })
-            .OnLostFocus((_, _, window) =>
-            {
-                window.PreviewKeyPressed -= HandlePreviewKeyPressed;
-                if (ReferenceEquals(hookedWindow, window)) hookedWindow = null;
-            })
-            .Build();
-        list.MouseClick += (_, _) => CompleteSelected();
-
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup()
             .AddLine($"[bold]{PresentationText.Escape(package.PackageId)}[/]")
             .AddLine($"[dim]Current rule: {PresentationText.Escape(currentRule)}[/]")
+            .AddLine("")
+            .AddLine("Choose an action from the toolbar below.")
             .WithMargin(1)
             .Build());
-        panel.AddControl(list);
-        panel.AddControl(Ctl.Markup("[dim]↑/↓ selects · Click / Space / Enter confirms · Esc closes[/]").Build());
+        var updatesEnabled = package.State != PackageRuleState.Ignored;
         StateChanged?.Invoke();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Close", (_, _) => completion.TrySetResult(PackageRuleDialogAction.Close)),
+            TuiChrome.Secondary("Clear rule", (_, _) => completion.TrySetResult(PackageRuleDialogAction.ClearRule)),
+            TuiChrome.Secondary(updatesEnabled ? "Disable updates" : "Enable updates",
+                (_, _) => completion.TrySetResult(PackageRuleDialogAction.ToggleUpdatesEnabled)),
+            TuiChrome.Primary("Force version", (_, _) => completion.TrySetResult(PackageRuleDialogAction.SelectVersion)));
     }
 }
 
@@ -219,7 +245,26 @@ internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
     public IWindowControl BuildContent(FlowChrome chrome)
     {
         var status = Ctl.Markup().Build();
-        var items = viewModel.Items.Select(package => new ListItem(package.DisplayText) { Tag = package }).ToArray();
+        static (string Icon, Color Color) PackageStyle(PackageRuleViewModel package) => package.State switch
+        {
+            PackageRuleState.Ignored => ("⊘", new Color("#FB7185")),
+            PackageRuleState.Forced => ("◆", new Color("#C084FC")),
+            _ => ("●", new Color("#34D399"))
+        };
+
+        static void ApplyPackageStyle(ListItem item, PackageRuleViewModel package)
+        {
+            var style = PackageStyle(package);
+            item.Text = package.DisplayText;
+            item.Icon = style.Icon;
+            item.IconColor = style.Color;
+        }
+
+        var items = viewModel.Items.Select(package =>
+        {
+            var style = PackageStyle(package);
+            return new ListItem(package.DisplayText, style.Icon, style.Color) { Tag = package };
+        }).ToArray();
         Window? hookedWindow = null;
         ListControl? list = null;
         var editing = false;
@@ -231,7 +276,7 @@ internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
             try
             {
                 await editPackage(package, window).ConfigureAwait(true);
-                item.Text = package.DisplayText;
+                ApplyPackageStyle(item, package);
                 UpdateStatus();
             }
             catch (OperationCanceledException)
@@ -257,7 +302,7 @@ internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
             }
         }
 
-        list = Ctl.List("Package update rules")
+        list = Ctl.List("Detected packages")
             .AddItems(items)
             .WithVerticalAlignment(VerticalAlignment.Fill)
             .OnItemActivated((_, _, window) => _ = EditSelectedPackageAsync(window))
@@ -289,25 +334,24 @@ internal sealed class PackageRulesContent : IFlowStepContent<PackageRulesAction>
             }
             var ignored = viewModel.Items.Count(x => x.State == PackageRuleState.Ignored);
             var forced = viewModel.Items.Count(x => x.State == PackageRuleState.Forced);
-            status.SetContent([$"[dim]{ignored} ignored · {forced} forced to exact versions · Click / Space / Enter edits · ↑/↓ navigates[/]"]);
+            status.SetContent([$"[#FB7185]{ignored} ignored[/] · [#C084FC]{forced} forced[/] · [dim]Click / Space / Enter edits · ↑/↓ navigates[/]"]);
             StateChanged?.Invoke();
         }
 
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
-        panel.AddControl(Ctl.Markup()
-            .AddLine("[bold]Select a package to change its update rule.[/]")
-            .AddLine("[dim][IGNORED] packages are skipped. [FORCED] packages are set to the shown version on every run, including downgrades and prereleases.[/]")
-            .AddLine("[dim]Saved packages not found in this scan stay visible so their rules can be cleared.[/]")
-            .WithMargin(1)
-            .Build());
+        var panel = TuiChrome.ScrollableBody();
+        // panel.AddControl(Ctl.Markup()
+        //     .AddLine("[bold]Select a package to change its update rule.[/]")
+        //     .AddLine("[dim][IGNORED] packages are skipped. [FORCED] packages are set to the shown version on every run, including downgrades and prereleases.[/]")
+        //     .AddLine("[dim]Saved packages not found in this scan stay visible so their rules can be cleared.[/]")
+        //     .WithMargin(1)
+        //     .Build());
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Save package rules")
-            .OnClick((_, _) => completion.TrySetResult(new(PackageRulesActionKind.Save)))
-            .Build());
-        panel.AddControl(Ctl.Button("Back without saving").OnClick((_, _) => completion.TrySetCanceled()).Build());
         UpdateStatus();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Back without saving", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary("Save package rules", (_, _) => completion.TrySetResult(new(PackageRulesActionKind.Save))));
     }
 }
 
@@ -319,6 +363,7 @@ internal sealed class PackageVersionSelectionContent : IFlowStepContent<PackageV
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string packageId;
     private readonly ImmutableArray<string> versions;
+    private ListControl? list;
 
     public PackageVersionSelectionContent(string packageId, ImmutableArray<string> versions)
     {
@@ -332,7 +377,7 @@ internal sealed class PackageVersionSelectionContent : IFlowStepContent<PackageV
     public IWindowControl BuildContent(FlowChrome chrome)
     {
         var status = Ctl.Markup().Build();
-        var list = Ctl.List("Available versions")
+        list = Ctl.List("Available versions")
             .WithVerticalAlignment(VerticalAlignment.Fill)
             .OnItemActivated((_, item) => completion.TrySetResult(new(item.Text)))
             .Build();
@@ -351,7 +396,7 @@ internal sealed class PackageVersionSelectionContent : IFlowStepContent<PackageV
             .WithPlaceholder("type any part of a version")
             .OnInputChanged((_, value) => Filter(value))
             .Build();
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup()
             .AddLine($"[bold]Force {PresentationText.Escape(packageId)} to an exact version.[/]")
             .AddLine("[dim]The list contains every version returned by the configured NuGet sources, including prereleases.[/]")
@@ -360,15 +405,14 @@ internal sealed class PackageVersionSelectionContent : IFlowStepContent<PackageV
         panel.AddControl(search);
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Use selected version")
-            .OnClick((_, _) =>
+        Filter(string.Empty);
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Cancel", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary("Use selected version", (_, _) =>
             {
                 if (list.SelectedItem is { } item) completion.TrySetResult(new(item.Text));
-            })
-            .Build());
-        panel.AddControl(Ctl.Button("Cancel").OnClick((_, _) => completion.TrySetCanceled()).Build());
-        Filter(string.Empty);
-        return panel;
+            }));
     }
 }
 
@@ -376,6 +420,8 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
 {
     private readonly TaskCompletionSource<ManualDecisionSelection?> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ImmutableArray<PackageDecisionViewModel> decisions;
+    private ListControl? list;
+    private Action? cycleSelected;
 
     public PackageDecisionContent(
         ImmutableArray<PackageGroup> groups,
@@ -390,8 +436,20 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
     public IWindowControl BuildContent(FlowChrome chrome)
     {
         var status = Ctl.Markup().Build();
-        var items = decisions.Select(decision => new ListItem(decision.DisplayText) { Tag = decision }).ToArray();
-        var list = Ctl.List("Package decisions")
+        static (string Icon, Color Color) DecisionStyle(PackageDecisionViewModel decision) => decision.Choice switch
+        {
+            UpgradeChoice.LatestMajor => ("▲", new Color("#FBBF24")),
+            UpgradeChoice.LatestMinor => ("↑", new Color("#38BDF8")),
+            UpgradeChoice.ExactVersion => ("◆", new Color("#C084FC")),
+            _ => ("·", new Color("#7C8DA6"))
+        };
+
+        var items = decisions.Select(decision =>
+        {
+            var style = DecisionStyle(decision);
+            return new ListItem(decision.DisplayText, style.Icon, style.Color) { Tag = decision };
+        }).ToArray();
+        list = Ctl.List("Package decisions")
             .AddItems(items)
             .WithVerticalAlignment(VerticalAlignment.Fill)
             .OnItemActivated((_, item) => Cycle(item))
@@ -410,11 +468,19 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
         {
             var decision = (PackageDecisionViewModel)item.Tag!;
             decision.Cycle();
+            var style = DecisionStyle(decision);
             item.Text = decision.DisplayText;
+            item.Icon = style.Icon;
+            item.IconColor = style.Color;
             UpdateStatus();
         }
 
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        cycleSelected = () =>
+        {
+            if (list.SelectedItem is { } item) Cycle(item);
+        };
+
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup()
             .AddLine("[bold]Set one decision per package.[/]")
             .AddLine("[dim]Choices cycle: no update → latest minor → latest major. Persistent forced versions are shown but cannot be changed here.[/]")
@@ -422,16 +488,13 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
             .Build());
         panel.AddControl(list);
         panel.AddControl(status);
-        panel.AddControl(Ctl.Button("Cycle selected")
-            .OnClick((_, _) => { if (list.SelectedItem is { } item) Cycle(item); })
-            .Build());
-        panel.AddControl(Ctl.Button("Apply decisions")
-            .OnClick((_, _) => completion.TrySetResult(new ManualDecisionSelection(
-                decisions.Select(x => x.ToDecision()).ToImmutableArray())))
-            .Build());
-        panel.AddControl(Ctl.Button("Cancel").OnClick((_, _) => completion.TrySetCanceled()).Build());
         UpdateStatus();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Secondary("Cycle selected", (_, _) => cycleSelected?.Invoke()),
+            TuiChrome.Danger("Cancel", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary("Apply decisions", (_, _) => completion.TrySetResult(new ManualDecisionSelection(
+                decisions.Select(x => x.ToDecision()).ToImmutableArray()))));
     }
 }
 
@@ -452,11 +515,12 @@ internal sealed class ScrollableMessageContent : IFlowStepContent<bool>
 
     public IWindowControl BuildContent(FlowChrome chrome)
     {
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup(message).WithMargin(1).Build());
-        panel.AddControl(Ctl.Button(closeLabel).OnClick((_, _) => completion.TrySetResult(true)).Build());
         StateChanged?.Invoke();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Primary(closeLabel, (_, _) => completion.TrySetResult(true)));
     }
 }
 
@@ -477,11 +541,12 @@ internal sealed class ScrollableConfirmationContent : IFlowStepContent<bool>
 
     public IWindowControl BuildContent(FlowChrome chrome)
     {
-        var panel = Ctl.ScrollablePanel().WithVerticalAlignment(VerticalAlignment.Fill).Build();
+        var panel = TuiChrome.ScrollableBody();
         panel.AddControl(Ctl.Markup(message).WithMargin(1).Build());
-        panel.AddControl(Ctl.Button(confirmLabel).OnClick((_, _) => completion.TrySetResult(true)).Build());
-        panel.AddControl(Ctl.Button("Cancel").OnClick((_, _) => completion.TrySetCanceled()).Build());
         StateChanged?.Invoke();
-        return panel;
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Cancel", (_, _) => completion.TrySetCanceled()),
+            TuiChrome.Primary(confirmLabel, (_, _) => completion.TrySetResult(true)));
     }
 }

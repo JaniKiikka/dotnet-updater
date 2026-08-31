@@ -13,6 +13,7 @@ using SharpConsoleUI.Dialogs;
 using SharpConsoleUI.Drivers;
 using SharpConsoleUI.Flows;
 using SharpConsoleUI.Layout;
+using SharpConsoleUI.Themes;
 using DialogsApi = SharpConsoleUI.Dialogs.Dialogs;
 
 namespace DotnetUpdater.Presentation;
@@ -53,7 +54,27 @@ public sealed class ConsoleApplication(
 
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var options = new ConsoleWindowSystemOptions(InstallSynchronizationContext: false);
-        var windowSystem = new ConsoleWindowSystem(new NetConsoleDriver(RenderMode.Buffer), options: options);
+        var theme = Theme.FromPalette(new Palette
+        {
+            Mode = ThemeMode.Dark,
+            Background = new Color("#07111F"),
+            Foreground = new Color("#DCEBFF"),
+            Primary = new Color("#38BDF8"),
+            Secondary = new Color("#818CF8"),
+            Tertiary = new Color("#C084FC"),
+            Info = new Color("#22D3EE"),
+            Success = new Color("#34D399"),
+            Warning = new Color("#FBBF24"),
+            Danger = new Color("#FB7185")
+        });
+        var windowSystem = new ConsoleWindowSystem(
+            new NetConsoleDriver(RenderMode.Buffer),
+            theme,
+            options);
+        var flowSurface = Controls.Flow()
+            .WithHorizontalAlignment(HorizontalAlignment.Stretch)
+            .WithVerticalAlignment(VerticalAlignment.Fill)
+            .Build();
         ConsoleCancelEventHandler handler = (_, eventArgs) =>
         {
             eventArgs.Cancel = true;
@@ -69,22 +90,14 @@ public sealed class ConsoleApplication(
             .Closable(false)
             .Minimizable(false)
             .Maximizable(false)
-            .AddControl(Controls.Markup()
-                .AddLine("[bold cyan].NET Multi-Project Updater[/]")
-                .AddLine("")
-                .AddLine("[dim]Guided NuGet upgrades across Git repositories[/]")
-                .AddLine("")
-                .AddLine("Use [bold]Tab[/] to move between controls, [bold]↑/↓[/] to navigate lists, and [bold]Enter[/] to activate.")
-                .AddLine("Press [bold]Esc[/] in a dialog to cancel the run. Ctrl+C requests cancellation between operations.")
-                .Centered()
-                .WithVerticalAlignment(VerticalAlignment.Center)
-                .Build())
+            .AddControl(flowSurface)
             .WithAsyncWindowThread(async (window, windowToken) =>
             {
                 using var workflowCancellation = CancellationTokenSource.CreateLinkedTokenSource(
                     cancellation.Token,
                     windowToken);
-                var exitCode = await RunFlowAsync(windowSystem, window, workflowCancellation.Token).ConfigureAwait(false);
+                var exitCode = await RunFlowAsync(windowSystem, window, flowSurface, workflowCancellation.Token)
+                    .ConfigureAwait(false);
                 windowSystem.Shutdown(exitCode);
             })
             .BuildAndShow();
@@ -99,12 +112,18 @@ public sealed class ConsoleApplication(
         }
     }
 
-    private async Task<int> RunFlowAsync(ConsoleWindowSystem windowSystem, Window parent, CancellationToken cancellationToken)
+    private async Task<int> RunFlowAsync(
+        ConsoleWindowSystem windowSystem,
+        Window parent,
+        SharpConsoleUI.Controls.FlowControl flowSurface,
+        CancellationToken cancellationToken)
     {
+        var mainHost = flowSurface.AsHost();
         var result = await Flow.Run<int>(
             windowSystem,
             parent,
-            context => RunWorkflowAsync(windowSystem, parent, context, cancellationToken),
+            context => RunWorkflowAsync(windowSystem, parent, mainHost, context, cancellationToken),
+            host: mainHost,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         if (result.Completed) return result.Value;
@@ -112,24 +131,24 @@ public sealed class ConsoleApplication(
 
         var message = result.Error?.Message ?? "The UI workflow failed unexpectedly.";
         logger.Write($"UI workflow failed: {result.Error}");
-        await DialogsApi.MessageAsync(
-            windowSystem,
+        await ShowMessageAsync(
+            mainHost,
             "Unexpected error",
-            $"The run could not continue.\n\n{PresentationText.Escape(message)}\n\nLog: {PresentationText.Escape(logger.Path)}",
-            severity: NotificationSeverityEnum.Danger,
-            parent: parent).ConfigureAwait(false);
+            $"[bold #FB7185]The run could not continue.[/]\n\n{PresentationText.Escape(message)}\n\n[dim]Log: {PresentationText.Escape(logger.Path)}[/]",
+            cancellationToken).ConfigureAwait(false);
         return 1;
     }
 
     private async Task<int> RunWorkflowAsync(
         ConsoleWindowSystem windowSystem,
         Window parent,
+        IFlowHost mainHost,
         FlowContext context,
         CancellationToken cancellationToken)
     {
         var loaded = await configurationStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         if (loaded.Warning is not null)
-            await ShowMessageAsync(windowSystem, parent, "Configuration warning",
+            await ShowMessageAsync(mainHost, "Configuration warning",
                 $"[yellow]⚠ {PresentationText.Escape(loaded.Warning)}[/]", cancellationToken).ConfigureAwait(false);
 
         var configuration = await ConfigureAsync(context, loaded.Configuration, cancellationToken).ConfigureAwait(false);
@@ -153,14 +172,14 @@ public sealed class ConsoleApplication(
                 .ToList();
             if (found.Warnings.Length > 10)
                 warnings.Add($"• {found.Warnings.Length - 10} additional warning(s) omitted");
-            await ShowMessageAsync(windowSystem, parent, "Scan warnings",
+            await ShowMessageAsync(mainHost, "Scan warnings",
                 "[yellow]Some paths could not be included.[/]\n\n" + string.Join('\n', warnings), cancellationToken)
                 .ConfigureAwait(false);
         }
 
         if (found.Entries.Length == 0)
         {
-            await ShowMessageAsync(windowSystem, parent, "Nothing found",
+            await ShowMessageAsync(mainHost, "Nothing found",
                 "No selectable solutions or standalone projects were found inside Git repositories.", cancellationToken)
                 .ConfigureAwait(false);
             return 2;
@@ -169,8 +188,7 @@ public sealed class ConsoleApplication(
         while (true)
         {
             var action = await PresentAsync(
-                windowSystem,
-                parent,
+                mainHost,
                 "Choose an action",
                 new ChoiceListContent<ApplicationActionOption>(
                     "Start an upgrade run or edit persistent package update rules.",
@@ -187,6 +205,7 @@ public sealed class ConsoleApplication(
             configuration = await ManagePackageRulesAsync(
                 windowSystem,
                 parent,
+                mainHost,
                 context,
                 found.Entries,
                 configuration,
@@ -194,8 +213,7 @@ public sealed class ConsoleApplication(
         }
 
         var entrySelection = await PresentAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Select solutions and projects",
             new EntrySelectionContent(found.Entries),
             cancellationToken).ConfigureAwait(false);
@@ -221,13 +239,13 @@ public sealed class ConsoleApplication(
                     $"{PresentationText.Escape(Path.GetFileName(x.ProjectPath))}: {PresentationText.Escape(x.UnsupportedReason!)}"))
             .ToArray();
         if (inventoryMessages.Length > 0)
-            await ShowMessageAsync(windowSystem, parent, "Unsupported or unavailable declarations",
+            await ShowMessageAsync(mainHost, "Unsupported or unavailable declarations",
                 string.Join('\n', inventoryMessages), cancellationToken).ConfigureAwait(false);
 
         var eligible = inventoryResult.Occurrences.Where(x => x.UnsupportedReason is null).ToArray();
         if (eligible.Length == 0)
         {
-            await ShowMessageAsync(windowSystem, parent, "No eligible packages",
+            await ShowMessageAsync(mainHost, "No eligible packages",
                 "No supported, non-ignored package declarations were found.", cancellationToken).ConfigureAwait(false);
             return 0;
         }
@@ -251,14 +269,13 @@ public sealed class ConsoleApplication(
 
         var unavailable = resolved.Where(x => x.ResolutionError is not null).ToArray();
         if (unavailable.Length > 0)
-            await ShowMessageAsync(windowSystem, parent, "Package resolution warnings",
+            await ShowMessageAsync(mainHost, "Package resolution warnings",
                 string.Join('\n', unavailable.Select(x =>
                     $"• {PresentationText.Escape(x.PackageId)}: {PresentationText.Escape(x.ResolutionError!)}")), cancellationToken)
                 .ConfigureAwait(false);
 
         var mode = await PresentAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Upgrade mode",
             new ChoiceListContent<UpgradeModeOption>(
                 "Choose how targets should be selected for every eligible package.",
@@ -284,8 +301,7 @@ public sealed class ConsoleApplication(
         else if (mode.Mode == UpgradeMode.SelectPackages)
         {
             var manual = await PresentAsync(
-                windowSystem,
-                parent,
+                mainHost,
                 "Select package upgrades",
                 new PackageDecisionContent(resolved, forcedVersions),
                 cancellationToken,
@@ -311,14 +327,13 @@ public sealed class ConsoleApplication(
                 DateTimeOffset.UtcNow);
         if (plan.Repositories.Length == 0)
         {
-            await ShowMessageAsync(windowSystem, parent, "Nothing to update",
+            await ShowMessageAsync(mainHost, "Nothing to update",
                 "The selected decisions produce no upgrades. No files will be changed.", cancellationToken).ConfigureAwait(false);
             return 0;
         }
 
         var reviewApproved = await ConfirmLargeAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Review immutable upgrade plan",
             PresentationText.Review(plan),
             "Run read-only preflight",
@@ -337,8 +352,7 @@ public sealed class ConsoleApplication(
 
         var readyCount = inspected.Count(x => x.IsReady);
         var approved = await ConfirmLargeAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Preflight results — final approval",
             PresentationText.Preflight(inspected) +
                 $"\n\n[bold]{readyCount} of {inspected.Length} repositories are ready.[/] " +
@@ -349,10 +363,9 @@ public sealed class ConsoleApplication(
 
         var byRoot = inspected.ToDictionary(x => x.RepositoryRoot, PathComparer);
         var progressViewModel = new RepositoryProgressViewModel(plan.Repositories.Select(x => x.RepositoryRoot));
-        var results = await DialogsApi.RunWithProgressAsync<ImmutableArray<RepositoryRunResult>>(
-            windowSystem,
+        var results = await context.RunWithProgress(
             "Upgrading repositories",
-            PresentationText.Progress(progressViewModel.Snapshot()),
+            $"0 of {plan.Repositories.Length} repositories complete…",
             async (token, progress) =>
             {
                 var terminalCount = 0;
@@ -363,21 +376,17 @@ public sealed class ConsoleApplication(
                     {
                         progressViewModel.Apply(value);
                         if (value.Stage is RunStage.Passed or RunStage.Failed or RunStage.Skipped) terminalCount++;
-                        progress.Report(new ProgressUpdate(
-                            (double)terminalCount / plan.Repositories.Length,
-                            PresentationText.Progress(progressViewModel.Snapshot()),
-                            false));
+                        progress.Report(
+                            $"{terminalCount} of {plan.Repositories.Length} complete · " +
+                            $"{Path.GetFileName(value.RepositoryRoot)}: {value.Stage} — {value.Message}");
                     }
                 });
                 return await coordinator.ExecuteAsync(plan, byRoot, reporter, token).ConfigureAwait(false);
-            },
-            allowMarkup: true,
-            parent: parent).ConfigureAwait(false);
+            }).ConfigureAwait(false);
         if (results.IsDefault) throw new OperationCanceledException();
 
         await ShowMessageAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Final summary",
             PresentationText.Summary(results),
             cancellationToken,
@@ -431,6 +440,7 @@ public sealed class ConsoleApplication(
     private async Task<AppConfiguration> ManagePackageRulesAsync(
         ConsoleWindowSystem windowSystem,
         Window parent,
+        IFlowHost mainHost,
         FlowContext context,
         ImmutableArray<SelectionEntry> entries,
         AppConfiguration configuration,
@@ -446,8 +456,7 @@ public sealed class ConsoleApplication(
 
         if (result.Warnings.Length > 0)
             await ShowMessageAsync(
-                windowSystem,
-                parent,
+                mainHost,
                 "Package inventory warnings",
                 string.Join('\n', result.Warnings.Select(x => $"• {PresentationText.Escape(x)}")),
                 cancellationToken).ConfigureAwait(false);
@@ -459,14 +468,14 @@ public sealed class ConsoleApplication(
 
         async Task EditPackageAsync(PackageRuleViewModel package, Window rulesWindow)
         {
-            var ruleAction = await PresentAsync(
+            var ruleAction = await PresentModalAsync(
                 windowSystem,
                 rulesWindow,
                 $"Package rule: {package.PackageId}",
                 new PackageRuleDialogContent(package),
                 cancellationToken,
-                width: 64,
-                height: 16).ConfigureAwait(true);
+                width: 84,
+                height: 18).ConfigureAwait(true);
             if (ruleAction == PackageRuleDialogAction.Close) return;
             if (ruleAction == PackageRuleDialogAction.ToggleUpdatesEnabled)
             {
@@ -480,7 +489,7 @@ public sealed class ConsoleApplication(
             }
             if (!package.IsDiscovered)
             {
-                await ShowMessageAsync(
+                await ShowModalMessageAsync(
                     windowSystem,
                     rulesWindow,
                     "Package versions unavailable",
@@ -491,18 +500,20 @@ public sealed class ConsoleApplication(
                 return;
             }
 
-            var lookup = await context.RunWithProgress(
+            var lookup = await DialogsApi.RunWithProgressAsync(
+                windowSystem,
                 "Loading package versions",
                 $"Querying configured NuGet sources for every {package.PackageId} version…",
                 (token, _) => versions.GetAllVersionsAsync(
                     package.ProjectPath!,
                     package.PackageId,
-                    token)).ConfigureAwait(false);
+                    token),
+                parent: rulesWindow).ConfigureAwait(false);
             if (lookup is null) throw new OperationCanceledException();
             if (lookup.Error is not null || lookup.Versions.Length == 0)
             {
                 var message = lookup.Error ?? "The configured NuGet sources returned no versions for this package.";
-                await ShowMessageAsync(
+                await ShowModalMessageAsync(
                     windowSystem,
                     rulesWindow,
                     "Package versions unavailable",
@@ -511,7 +522,7 @@ public sealed class ConsoleApplication(
                 return;
             }
 
-            var selection = await PresentAsync(
+            var selection = await PresentModalAsync(
                 windowSystem,
                 rulesWindow,
                 $"Select {package.PackageId} version",
@@ -523,8 +534,7 @@ public sealed class ConsoleApplication(
         }
 
         var action = await PresentAsync(
-            windowSystem,
-            parent,
+            mainHost,
             "Package update rules",
             new PackageRulesContent(viewModel, EditPackageAsync),
             cancellationToken,
@@ -601,6 +611,21 @@ public sealed class ConsoleApplication(
     }
 
     private static async Task<T?> PresentAsync<T>(
+        IFlowHost host,
+        string title,
+        IFlowStepContent<T> content,
+        CancellationToken cancellationToken,
+        int width = 100,
+        int height = 28)
+    {
+        var outcome = await host.PresentAsync(
+            content,
+            new FlowChrome(title, widthHint: width, heightHint: height),
+            cancellationToken).ConfigureAwait(false);
+        return outcome.Verdict == FlowVerdict.Cancel ? default : outcome.Value;
+    }
+
+    private static async Task<T?> PresentModalAsync<T>(
         ConsoleWindowSystem windowSystem,
         Window parent,
         string title,
@@ -618,6 +643,21 @@ public sealed class ConsoleApplication(
     }
 
     private static async Task ShowMessageAsync(
+        IFlowHost host,
+        string title,
+        string message,
+        CancellationToken cancellationToken,
+        int width = 100,
+        int height = 28) =>
+        _ = await PresentAsync(
+            host,
+            title,
+            new ScrollableMessageContent(message),
+            cancellationToken,
+            width,
+            height).ConfigureAwait(false);
+
+    private static async Task ShowModalMessageAsync(
         ConsoleWindowSystem windowSystem,
         Window parent,
         string title,
@@ -625,7 +665,7 @@ public sealed class ConsoleApplication(
         CancellationToken cancellationToken,
         int width = 100,
         int height = 28) =>
-        _ = await PresentAsync(
+        _ = await PresentModalAsync(
             windowSystem,
             parent,
             title,
@@ -635,16 +675,14 @@ public sealed class ConsoleApplication(
             height).ConfigureAwait(false);
 
     private static async Task<bool> ConfirmLargeAsync(
-        ConsoleWindowSystem windowSystem,
-        Window parent,
+        IFlowHost host,
         string title,
         string message,
         string confirmLabel,
         CancellationToken cancellationToken)
     {
         var result = await PresentAsync(
-            windowSystem,
-            parent,
+            host,
             title,
             new ScrollableConfirmationContent(message, confirmLabel),
             cancellationToken,
