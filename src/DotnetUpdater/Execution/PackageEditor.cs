@@ -2,21 +2,26 @@ using System.Collections.Immutable;
 using System.Text;
 using System.Xml.Linq;
 using DotnetUpdater.Domain;
+using DotnetUpdater.IO;
 
 namespace DotnetUpdater.Execution;
 
 public sealed record EditValidation(bool IsValid, string? Error);
 public sealed record EditResult(bool Succeeded, ImmutableArray<string> ChangedPaths, string? Error);
 
-public sealed class PackageEditor
+public sealed class PackageEditor(IRealPathContainment? containment = null)
 {
+    private readonly IRealPathContainment _containment = containment ?? new RealPathContainment();
+
     public EditValidation Validate(IEnumerable<DeclarationEdit> edits)
     {
         foreach (var edit in edits)
         {
             try
             {
-                var document = XDocument.Load(edit.DeclarationPath, LoadOptions.PreserveWhitespace);
+                if (!TryResolveForMutation(edit, out var executionPath, out var containmentError))
+                    return new(false, containmentError);
+                var document = XDocument.Load(executionPath, LoadOptions.PreserveWhitespace);
                 var located = Locate(document, edit);
                 if (located.Error is not null) return new(false, located.Error);
                 if (!string.Equals(located.Value, edit.OldVersion, StringComparison.Ordinal))
@@ -33,12 +38,14 @@ public sealed class PackageEditor
         var edits = source.ToArray();
         var validation = Validate(edits);
         if (!validation.IsValid) return new(false, [], validation.Error);
-        var temporaryFiles = new List<(string Temporary, string Destination)>();
+        var temporaryFiles = new List<PendingMove>();
         try
         {
-            foreach (var fileGroup in edits.GroupBy(x => x.DeclarationPath, PathComparer))
+            foreach (var fileGroup in edits.GroupBy(x => x.ResolvedDeclarationPath, PathComparer))
             {
-                var path = fileGroup.Key;
+                var firstEdit = fileGroup.First();
+                if (!TryResolveForMutation(firstEdit, out var path, out var containmentError))
+                    return new(false, [], containmentError);
                 var original = File.ReadAllText(path);
                 var hasBom = File.ReadAllBytes(path).AsSpan().StartsWith(Encoding.UTF8.Preamble);
                 var document = XDocument.Parse(original, LoadOptions.PreserveWhitespace);
@@ -55,11 +62,18 @@ public sealed class PackageEditor
                 var changed = document.ToString(SaveOptions.DisableFormatting);
                 if (original.EndsWith("\r\n", StringComparison.Ordinal) && !changed.EndsWith("\r\n", StringComparison.Ordinal)) changed += "\r\n";
                 else if (original.EndsWith('\n') && !changed.EndsWith('\n')) changed += "\n";
+                if (!TryResolveForMutation(firstEdit, out path, out containmentError))
+                    return new(false, [], containmentError);
                 var temporary = path + $".{Guid.NewGuid():N}.tmp";
                 File.WriteAllText(temporary, changed, new UTF8Encoding(hasBom));
-                temporaryFiles.Add((temporary, path));
+                temporaryFiles.Add(new(temporary, path, firstEdit));
             }
-            foreach (var item in temporaryFiles) File.Move(item.Temporary, item.Destination, true);
+            foreach (var item in temporaryFiles)
+            {
+                if (!TryResolveForMutation(item.Edit, out var destination, out var containmentError))
+                    return new(false, [], containmentError);
+                File.Move(item.Temporary, destination, true);
+            }
             return new(true, temporaryFiles.Select(x => x.Destination).ToImmutableArray(), null);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Xml.XmlException)
@@ -68,6 +82,52 @@ public sealed class PackageEditor
         {
             foreach (var item in temporaryFiles) if (File.Exists(item.Temporary)) File.Delete(item.Temporary);
         }
+    }
+
+    private bool TryResolveForMutation(
+        DeclarationEdit edit,
+        out string executionPath,
+        out string error)
+    {
+        executionPath = string.Empty;
+        error = string.Empty;
+        if (!TryResolveStable(edit.ProjectsRoot, edit.ResolvedProjectsRoot, "projects folder", out var projectsRoot, out error) ||
+            !TryResolveStable(edit.RepositoryRoot, edit.ResolvedRepositoryRoot, "repository", out var repositoryRoot, out error) ||
+            !TryResolveStable(edit.DeclarationPath, edit.ResolvedDeclarationPath, "declaration", out executionPath, out error))
+            return false;
+
+        if (!_containment.IsWithin(projectsRoot, executionPath) ||
+            !_containment.IsWithin(repositoryRoot, executionPath) ||
+            !_containment.IsWithin(projectsRoot, repositoryRoot))
+        {
+            error = $"{edit.DeclarationPath}: resolved target escapes the reviewed projects folder or repository ({executionPath}).";
+            return false;
+        }
+        return true;
+    }
+
+    private bool TryResolveStable(
+        string displayPath,
+        string plannedResolvedPath,
+        string kind,
+        out string resolvedPath,
+        out string error)
+    {
+        resolvedPath = string.Empty;
+        var current = _containment.ResolveExisting(displayPath);
+        if (!current.Succeeded)
+        {
+            error = $"{displayPath}: {kind} real path could not be resolved. {current.Error}";
+            return false;
+        }
+        if (!_containment.PathsEqual(current.ResolvedPath!, plannedResolvedPath))
+        {
+            error = $"{displayPath}: {kind} target changed after planning ({plannedResolvedPath} -> {current.ResolvedPath}).";
+            return false;
+        }
+        resolvedPath = current.ResolvedPath!;
+        error = string.Empty;
+        return true;
     }
 
     private static LocatedVersion Locate(XDocument document, DeclarationEdit edit)
@@ -99,5 +159,6 @@ public sealed class PackageEditor
     }
 
     private sealed record LocatedVersion(string? Value, XAttribute? Attribute, XElement? Element, string? Error);
+    private sealed record PendingMove(string Temporary, string Destination, DeclarationEdit Edit);
     private static StringComparer PathComparer => OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 }

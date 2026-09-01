@@ -4,7 +4,7 @@
 
 ### Repository-aware discovery
 
-`DiscoveryService` groups selectable solutions and standalone projects by their containing Git repository. Solution members are validated to ensure they exist and remain inside the repository. Broken references and projects outside Git repositories become warnings rather than fatal scan errors.
+`DiscoveryService` groups selectable solutions and standalone projects by their containing Git repository. Solution members are resolved through every symbolic-link or reparse-point component and must remain inside both the configured projects folder and their repository. Broken, cyclic, unresolvable, and escaping references become warnings rather than fatal scan errors.
 
 Example input tree:
 
@@ -113,7 +113,7 @@ public sealed record DiscoveryResult(
     ImmutableArray<DiscoveryWarning> Warnings);
 ```
 
-`result.Entries` flattens all repository entries. Paths are canonical absolute paths.
+`result.Entries` flattens all repository entries. Reviewed display paths are canonical absolute paths; corresponding `Resolved*` properties retain the real execution targets used by inventory, preflight, and execution.
 
 ### `PackageInventoryService.Read`
 

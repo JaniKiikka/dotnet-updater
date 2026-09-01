@@ -1,10 +1,12 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Text.Json;
 using DotnetUpdater.Configuration;
 using DotnetUpdater.Discovery;
 using DotnetUpdater.Domain;
 using DotnetUpdater.Execution;
+using DotnetUpdater.IO;
 using DotnetUpdater.Packages;
 using DotnetUpdater.Planning;
 using DotnetUpdater.Presentation;
@@ -265,6 +267,72 @@ public sealed class DiscoveryServiceTests
         Assert.IsTrue(result.Entries.Any(x => x.Kind == EntryKind.SolutionXml && x.ProjectPaths.Length == 1));
         Assert.IsTrue(result.Entries.Any(x => x.Kind == EntryKind.StandaloneProject && x.Path.EndsWith("Loose.csproj", StringComparison.Ordinal)));
     }
+
+    [TestMethod]
+    public void ScanRejectsSolutionProjectWhoseDirectoryLinkEscapesRepository()
+    {
+        using var temp = new TempDirectory();
+        var repo = Directory.CreateDirectory(Path.Combine(temp.Path, "repo")).FullName;
+        var external = Directory.CreateDirectory(Path.Combine(temp.Path, "external")).FullName;
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        var externalProject = Path.Combine(external, "External.csproj");
+        File.WriteAllText(externalProject, "<Project />");
+        var timestamp = File.GetLastWriteTimeUtc(externalProject);
+        DirectoryLink.Create(Path.Combine(repo, "linked"), external);
+        File.WriteAllText(Path.Combine(repo, "App.slnx"),
+            "<Solution><Project Path=\"linked/External.csproj\" /></Solution>");
+
+        var result = new DiscoveryService().Scan(temp.Path);
+
+        var solution = result.Entries.Single(x => x.Kind == EntryKind.SolutionXml);
+        Assert.IsEmpty(solution.ProjectPaths);
+        Assert.IsTrue(result.Warnings.Any(x => x.Message.Contains("resolved target escapes", StringComparison.OrdinalIgnoreCase)));
+        Assert.IsEmpty(new PackageInventoryService().Read([solution], new HashSet<string>()).Occurrences);
+        Assert.AreEqual("<Project />", File.ReadAllText(externalProject));
+        Assert.AreEqual(timestamp, File.GetLastWriteTimeUtc(externalProject));
+    }
+
+    [TestMethod]
+    public void ScanAllowsDirectoryLinkWhoseResolvedProjectRemainsInRepository()
+    {
+        using var temp = new TempDirectory();
+        var repo = Directory.CreateDirectory(Path.Combine(temp.Path, "repo")).FullName;
+        var shared = Directory.CreateDirectory(Path.Combine(repo, "shared")).FullName;
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        var project = Path.Combine(shared, "Internal.csproj");
+        File.WriteAllText(project, "<Project />");
+        DirectoryLink.Create(Path.Combine(repo, "linked"), shared);
+        File.WriteAllText(Path.Combine(repo, "App.slnx"),
+            "<Solution><Project Path=\"linked/Internal.csproj\" /></Solution>");
+
+        var result = new DiscoveryService().Scan(temp.Path);
+
+        var solution = result.Entries.Single(x => x.Kind == EntryKind.SolutionXml);
+        Assert.HasCount(1, solution.ProjectPaths);
+        Assert.IsTrue(new RealPathContainment().PathsEqual(project, solution.ResolvedProjectPaths.Single()));
+        Assert.IsFalse(result.Entries.Any(x => x.Kind == EntryKind.StandaloneProject));
+    }
+
+    [TestMethod]
+    public void ScanRejectsSolutionProjectReachedThroughLinkCycle()
+    {
+        using var temp = new TempDirectory();
+        var repo = Directory.CreateDirectory(Path.Combine(temp.Path, "repo")).FullName;
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        var cycleA = Directory.CreateDirectory(Path.Combine(repo, "cycle-a")).FullName;
+        var cycleB = Directory.CreateDirectory(Path.Combine(repo, "cycle-b")).FullName;
+        DirectoryLink.Create(Path.Combine(cycleA, "to-b"), cycleB);
+        DirectoryLink.Create(Path.Combine(cycleB, "to-a"), cycleA);
+        File.WriteAllText(Path.Combine(repo, "App.slnx"),
+            "<Solution><Project Path=\"cycle-a/to-b/to-a/to-b/Cycle.csproj\" /></Solution>");
+
+        var result = new DiscoveryService().Scan(temp.Path);
+
+        Assert.IsEmpty(result.Entries.Single().ProjectPaths);
+        Assert.IsTrue(result.Warnings.Any(x =>
+            x.Message.Contains("cycle", StringComparison.OrdinalIgnoreCase) ||
+            x.Message.Contains("resolve", StringComparison.OrdinalIgnoreCase)));
+    }
 }
 
 [TestClass]
@@ -298,6 +366,31 @@ public sealed class PackageInventoryServiceTests
             DeclarationKind.CentralPackageVersion,
             result.Occurrences.Single(x => x.PackageId == "Central.One").Declaration.Kind);
         Assert.IsNotNull(result.Occurrences.Single(x => x.PackageId == "Unsupported").UnsupportedReason);
+    }
+
+    [TestMethod]
+    public void ReadNeverLoadsCentralPackageFileThroughEscapingFileLink()
+    {
+        using var temp = new TempDirectory();
+        var repo = Directory.CreateDirectory(Path.Combine(temp.Path, "repo")).FullName;
+        var external = Directory.CreateDirectory(Path.Combine(temp.Path, "external")).FullName;
+        Directory.CreateDirectory(Path.Combine(repo, ".git"));
+        var externalProps = Path.Combine(external, "Directory.Packages.props");
+        const string sentinel = "<Project><ItemGroup><PackageVersion Include=\"Central.One\" Version=\"9.9.9\" /></ItemGroup></Project>";
+        File.WriteAllText(externalProps, sentinel);
+        var timestamp = File.GetLastWriteTimeUtc(externalProps);
+        File.CreateSymbolicLink(Path.Combine(repo, "Directory.Packages.props"), externalProps);
+        var project = Path.Combine(repo, "App.csproj");
+        File.WriteAllText(project,
+            "<Project><ItemGroup><PackageReference Include=\"Central.One\" /></ItemGroup></Project>");
+        var entry = new DiscoveryService().Scan(temp.Path).Entries.Single();
+
+        var result = new PackageInventoryService().Read([entry], new HashSet<string>());
+
+        Assert.IsNotNull(result.Occurrences.Single().UnsupportedReason);
+        Assert.IsTrue(result.Warnings.Any(x => x.Contains("escapes", StringComparison.OrdinalIgnoreCase)));
+        Assert.AreEqual(sentinel, File.ReadAllText(externalProps));
+        Assert.AreEqual(timestamp, File.GetLastWriteTimeUtc(externalProps));
     }
 }
 
@@ -470,6 +563,87 @@ public sealed class PackageEditorTests
         Assert.IsTrue(result.Succeeded);
         StringAssert.Contains(File.ReadAllText(path), "Version=\"1.2.0\"");
         Assert.IsFalse(editor.Validate([edit]).IsValid);
+    }
+
+    [TestMethod]
+    public async Task PreflightAndApplyFailClosedWhenDirectoryChangesToEscapingLinkAfterPlanning()
+    {
+        using var temp = new TempDirectory();
+        var repo = Directory.CreateDirectory(Path.Combine(temp.Path, "repo")).FullName;
+        var work = Directory.CreateDirectory(Path.Combine(repo, "work")).FullName;
+        var external = Directory.CreateDirectory(Path.Combine(temp.Path, "external")).FullName;
+        var declaration = Path.Combine(work, "App.csproj");
+        var validationTarget = Path.Combine(repo, "Repo.slnx");
+        const string original = "<Project><ItemGroup><PackageReference Include=\"Thing\" Version=\"1.0.0\" /></ItemGroup></Project>";
+        File.WriteAllText(declaration, original);
+        File.WriteAllText(validationTarget, "<Solution />");
+        var paths = new RealPathContainment();
+        var resolvedDeclaration = paths.ResolveExisting(declaration).ResolvedPath!;
+        var resolvedTarget = paths.ResolveExisting(validationTarget).ResolvedPath!;
+        var edit = new DeclarationEdit(repo, declaration, "Thing", "1.0.0", "2.0.0",
+            DeclarationKind.PackageReferenceAttribute, "PackageReference:Thing:attribute")
+        {
+            ProjectsRoot = temp.Path,
+            ResolvedProjectsRoot = paths.ResolveExisting(temp.Path).ResolvedPath!,
+            ResolvedRepositoryRoot = paths.ResolveExisting(repo).ResolvedPath!,
+            ResolvedDeclarationPath = resolvedDeclaration
+        };
+        var repository = new RepositoryPlan(repo, [validationTarget], [edit])
+        {
+            ProjectsRoot = temp.Path,
+            ResolvedProjectsRoot = paths.ResolveExisting(temp.Path).ResolvedPath!,
+            ResolvedRepositoryRoot = paths.ResolveExisting(repo).ResolvedPath!,
+            ResolvedValidationTargets = [resolvedTarget]
+        };
+        var externalDeclaration = Path.Combine(external, "App.csproj");
+        File.WriteAllText(externalDeclaration, original);
+        var sentinelTimestamp = File.GetLastWriteTimeUtc(externalDeclaration);
+        Directory.Move(work, Path.Combine(repo, "planned-work"));
+        DirectoryLink.Create(work, external);
+        var editor = new PackageEditor(paths);
+        var fake = new RecordingRunner(request => request.Arguments.SequenceEqual(["branch", "--show-current"])
+            ? new(0, "main\n", string.Empty)
+            : request.Arguments.SequenceEqual(["rev-parse", "--is-inside-work-tree"])
+                ? new(0, "true\n", string.Empty)
+                : new(0, string.Empty, string.Empty));
+        var plan = new UpgradePlan(new("origin", null, null, false), [repository], DateTimeOffset.UnixEpoch);
+
+        var preflight = (await new PreflightService(fake, editor, paths).InspectAsync(plan, default)).Single();
+        var applied = editor.Apply([edit]);
+
+        Assert.IsFalse(preflight.IsReady);
+        Assert.IsTrue(preflight.Issues.Any(x => x.Message.Contains("changed after planning", StringComparison.OrdinalIgnoreCase)));
+        Assert.IsFalse(applied.Succeeded);
+        Assert.AreEqual(original, File.ReadAllText(externalDeclaration));
+        Assert.AreEqual(sentinelTimestamp, File.GetLastWriteTimeUtc(externalDeclaration));
+    }
+}
+
+[TestClass]
+public sealed class RealPathContainmentTests
+{
+    [TestMethod]
+    public void ResolveExistingHandlesSymbolicLinksOrWindowsReparsePointsAndCycles()
+    {
+        using var temp = new TempDirectory();
+        var target = Directory.CreateDirectory(Path.Combine(temp.Path, "target")).FullName;
+        var file = Path.Combine(target, "App.csproj");
+        File.WriteAllText(file, "<Project />");
+        var link = Path.Combine(temp.Path, "link");
+        DirectoryLink.Create(link, target);
+        var paths = new RealPathContainment();
+
+        var resolved = paths.ResolveExisting(Path.Combine(link, "App.csproj"));
+
+        Assert.IsTrue(resolved.Succeeded, resolved.Error);
+        Assert.IsTrue(paths.PathsEqual(file, resolved.ResolvedPath!));
+
+        var cycleA = Directory.CreateDirectory(Path.Combine(temp.Path, "cycle-a")).FullName;
+        var cycleB = Directory.CreateDirectory(Path.Combine(temp.Path, "cycle-b")).FullName;
+        DirectoryLink.Create(Path.Combine(cycleA, "to-b"), cycleB);
+        DirectoryLink.Create(Path.Combine(cycleB, "to-a"), cycleA);
+        var cycle = paths.ResolveExisting(Path.Combine(cycleA, "to-b", "to-a", "to-b", "App.csproj"));
+        Assert.IsFalse(cycle.Succeeded);
     }
 }
 
@@ -813,6 +987,30 @@ internal sealed class TempDirectory : IDisposable
         catch (IOException)
         {
         }
+    }
+}
+
+internal static class DirectoryLink
+{
+    public static void Create(string linkPath, string targetPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Directory.CreateSymbolicLink(linkPath, targetPath);
+            return;
+        }
+
+        using var process = Process.Start(new ProcessStartInfo("cmd.exe")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            ArgumentList = { "/d", "/c", "mklink", "/J", linkPath, targetPath }
+        }) ?? throw new InvalidOperationException("Could not start mklink for junction test setup.");
+        process.WaitForExit();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"Could not create test junction: {process.StandardError.ReadToEnd()}");
     }
 }
 

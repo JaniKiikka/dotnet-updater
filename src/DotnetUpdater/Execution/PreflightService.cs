@@ -1,50 +1,73 @@
 using System.Collections.Immutable;
 using DotnetUpdater.Domain;
+using DotnetUpdater.IO;
 
 namespace DotnetUpdater.Execution;
 
-public sealed class PreflightService(IProcessRunner runner, PackageEditor editor)
+public sealed class PreflightService(
+    IProcessRunner runner,
+    PackageEditor editor,
+    IRealPathContainment? containment = null)
 {
+    private readonly IRealPathContainment _containment = containment ?? new RealPathContainment();
+
     public async Task<ImmutableArray<RepositoryPreflight>> InspectAsync(UpgradePlan plan, CancellationToken cancellationToken)
     {
         var output = ImmutableArray.CreateBuilder<RepositoryPreflight>();
         foreach (var repository in plan.Repositories)
         {
             var issues = ImmutableArray.CreateBuilder<PreflightIssue>();
-            if (!Directory.Exists(repository.RepositoryRoot)) issues.Add(new(repository.RepositoryRoot, "Repository no longer exists."));
-            foreach (var target in repository.ValidationTargets.Where(path => !File.Exists(path)))
-                issues.Add(new(repository.RepositoryRoot, $"Validation target no longer exists: {target}"));
-            foreach (var edit in repository.Edits.Where(edit => !File.Exists(edit.DeclarationPath)))
-                issues.Add(new(repository.RepositoryRoot, $"Declaration file no longer exists: {edit.DeclarationPath}"));
+            var resolvedProjectsRoot = ResolveStable(repository, repository.ProjectsRoot,
+                repository.ResolvedProjectsRoot, "Projects folder", issues);
+            var resolvedRepositoryRoot = ResolveStable(repository, repository.RepositoryRoot,
+                repository.ResolvedRepositoryRoot, "Repository", issues);
+            if (resolvedProjectsRoot is not null && resolvedRepositoryRoot is not null &&
+                !_containment.IsWithin(resolvedProjectsRoot, resolvedRepositoryRoot))
+                issues.Add(new(repository.RepositoryRoot,
+                    $"Repository resolved target escapes the projects folder: {repository.RepositoryRoot} -> {resolvedRepositoryRoot}"));
+            for (var index = 0; index < repository.ValidationTargets.Length; index++)
+            {
+                var target = repository.ValidationTargets[index];
+                var planned = index < repository.ResolvedValidationTargets.Length
+                    ? repository.ResolvedValidationTargets[index]
+                    : target;
+                var resolvedTarget = ResolveStable(repository, target, planned, "Validation target", issues);
+                if (resolvedTarget is not null && resolvedProjectsRoot is not null && resolvedRepositoryRoot is not null &&
+                    (!_containment.IsWithin(resolvedProjectsRoot, resolvedTarget) ||
+                     !_containment.IsWithin(resolvedRepositoryRoot, resolvedTarget)))
+                    issues.Add(new(repository.RepositoryRoot,
+                        $"Validation target escapes the projects folder or repository: {target} -> {resolvedTarget}"));
+            }
 
             if (issues.Count == 0)
             {
-                await CheckTool("git", ["--version"], repository.RepositoryRoot, "Git is unavailable.", issues, cancellationToken);
-                await CheckTool("dotnet", ["--version"], repository.RepositoryRoot, ".NET SDK is unavailable.", issues, cancellationToken);
-                var workTree = await runner.RunAsync(new("git", ["rev-parse", "--is-inside-work-tree"], repository.RepositoryRoot), cancellationToken);
+                var executionRoot = resolvedRepositoryRoot!;
+                await CheckTool("git", ["--version"], executionRoot, "Git is unavailable.", issues, cancellationToken);
+                await CheckTool("dotnet", ["--version"], executionRoot, ".NET SDK is unavailable.", issues, cancellationToken);
+                var workTree = await runner.RunAsync(new("git", ["rev-parse", "--is-inside-work-tree"], executionRoot), cancellationToken);
                 if (!workTree.Succeeded || !workTree.StandardOutput.Trim().Equals("true", StringComparison.OrdinalIgnoreCase))
                     issues.Add(new(repository.RepositoryRoot, "Path is not a Git working tree."));
 
                 if (plan.Git.BaseBranch is { } baseBranch)
                 {
-                    await CheckBranchName(repository.RepositoryRoot, baseBranch, issues, cancellationToken);
-                    var remoteBase = await RemoteBranchExists(repository.RepositoryRoot, plan.Git.RemoteName, baseBranch, cancellationToken);
+                    await CheckBranchName(executionRoot, baseBranch, issues, cancellationToken);
+                    var remoteBase = await RemoteBranchExists(executionRoot, plan.Git.RemoteName, baseBranch, cancellationToken);
                     if (!remoteBase.Succeeded)
                         issues.Add(new(repository.RepositoryRoot, $"Could not inspect remote {plan.Git.RemoteName}."));
-                    var baseExists = await RefExists(repository.RepositoryRoot, $"refs/heads/{baseBranch}", cancellationToken) ||
-                        await RefExists(repository.RepositoryRoot, $"refs/remotes/{plan.Git.RemoteName}/{baseBranch}", cancellationToken) || remoteBase.Exists;
+                    var baseExists = await RefExists(executionRoot, $"refs/heads/{baseBranch}", cancellationToken) ||
+                        await RefExists(executionRoot, $"refs/remotes/{plan.Git.RemoteName}/{baseBranch}", cancellationToken) || remoteBase.Exists;
                     if (!baseExists)
                         issues.Add(new(repository.RepositoryRoot, $"Base branch {baseBranch} does not exist locally or on {plan.Git.RemoteName}."));
                 }
 
                 if (plan.Git.TargetBranch is { } targetBranch)
                 {
-                    await CheckBranchName(repository.RepositoryRoot, targetBranch, issues, cancellationToken);
-                    var targetExists = await RefExists(repository.RepositoryRoot, $"refs/heads/{targetBranch}", cancellationToken) ||
-                        await RefExists(repository.RepositoryRoot, $"refs/remotes/{plan.Git.RemoteName}/{targetBranch}", cancellationToken);
+                    await CheckBranchName(executionRoot, targetBranch, issues, cancellationToken);
+                    var targetExists = await RefExists(executionRoot, $"refs/heads/{targetBranch}", cancellationToken) ||
+                        await RefExists(executionRoot, $"refs/remotes/{plan.Git.RemoteName}/{targetBranch}", cancellationToken);
                     if (plan.Git.BaseBranch is not null || plan.Git.CommitAndPush)
                     {
-                        var remoteTarget = await RemoteBranchExists(repository.RepositoryRoot, plan.Git.RemoteName, targetBranch, cancellationToken);
+                        var remoteTarget = await RemoteBranchExists(executionRoot, plan.Git.RemoteName, targetBranch, cancellationToken);
                         if (!remoteTarget.Succeeded)
                             issues.Add(new(repository.RepositoryRoot, $"Could not inspect remote {plan.Git.RemoteName}."));
                         targetExists |= remoteTarget.Exists;
@@ -56,13 +79,13 @@ public sealed class PreflightService(IProcessRunner runner, PackageEditor editor
                 if (plan.Git.UpdatesCurrentBranch)
                 {
                     var current = await runner.RunAsync(
-                        new("git", ["branch", "--show-current"], repository.RepositoryRoot), cancellationToken);
+                        new("git", ["branch", "--show-current"], executionRoot), cancellationToken);
                     if (!current.Succeeded || string.IsNullOrWhiteSpace(current.StandardOutput))
                         issues.Add(new(repository.RepositoryRoot, "Cannot update the current branch while HEAD is detached."));
                 }
                 if (plan.Git.CommitAndPush && plan.Git.BaseBranch is null && plan.Git.TargetBranch is null)
                 {
-                    await CheckRemote(repository.RepositoryRoot, plan.Git.RemoteName, issues, cancellationToken);
+                    await CheckRemote(executionRoot, plan.Git.RemoteName, issues, cancellationToken);
                 }
 
                 var validation = editor.Validate(repository.Edits);
@@ -71,6 +94,29 @@ public sealed class PreflightService(IProcessRunner runner, PackageEditor editor
             output.Add(new(repository.RepositoryRoot, issues.Count == 0, issues.ToImmutable()));
         }
         return output.ToImmutable();
+    }
+
+    private string? ResolveStable(
+        RepositoryPlan repository,
+        string displayPath,
+        string plannedResolvedPath,
+        string kind,
+        ImmutableArray<PreflightIssue>.Builder issues)
+    {
+        var current = _containment.ResolveExisting(displayPath);
+        if (!current.Succeeded)
+        {
+            issues.Add(new(repository.RepositoryRoot,
+                $"{kind} real path could not be resolved: {displayPath}. {current.Error}"));
+            return null;
+        }
+        if (!_containment.PathsEqual(current.ResolvedPath!, plannedResolvedPath))
+        {
+            issues.Add(new(repository.RepositoryRoot,
+                $"{kind} target changed after planning: {displayPath} ({plannedResolvedPath} -> {current.ResolvedPath})."));
+            return null;
+        }
+        return current.ResolvedPath;
     }
 
     private async Task<bool> RefExists(string root, string reference, CancellationToken token)

@@ -35,10 +35,18 @@ public sealed class UpgradePlanner
                 if (isForced
                     ? string.Equals(occurrence.CurrentVersion, decision.TargetVersion, StringComparison.OrdinalIgnoreCase)
                     : target.CompareTo(current) <= 0) continue;
-                var repository = selected.FirstOrDefault(x => x.ProjectPaths.Contains(occurrence.ProjectPath, PathComparer))?.RepositoryRoot;
-                if (repository is null) continue;
-                edits.Add(new(repository, occurrence.Declaration.Path, occurrence.PackageId, occurrence.CurrentVersion,
-                    decision.TargetVersion!, occurrence.Declaration.Kind, occurrence.Declaration.Locator, isForced));
+                var entry = selected.FirstOrDefault(x =>
+                    x.ResolvedProjectPaths.Contains(occurrence.ResolvedProjectPath, PathComparer));
+                if (entry is null) continue;
+                edits.Add(new DeclarationEdit(entry.RepositoryRoot, occurrence.Declaration.Path,
+                    occurrence.PackageId, occurrence.CurrentVersion, decision.TargetVersion!,
+                    occurrence.Declaration.Kind, occurrence.Declaration.Locator, isForced)
+                {
+                    ProjectsRoot = entry.ProjectsRoot,
+                    ResolvedProjectsRoot = entry.ResolvedProjectsRoot,
+                    ResolvedRepositoryRoot = entry.ResolvedRepositoryRoot,
+                    ResolvedDeclarationPath = occurrence.Declaration.ResolvedPath
+                });
             }
         }
 
@@ -46,11 +54,23 @@ public sealed class UpgradePlanner
 
         var repositories = selected.GroupBy(x => x.RepositoryRoot, PathComparer)
             .OrderBy(x => x.Key, PathComparer)
-            .Select(group => new RepositoryPlan(
-                group.Key,
-                group.Select(x => x.Path).Distinct(PathComparer).OrderBy(x => x, PathComparer).ToImmutableArray(),
-                uniqueEdits.Where(x => PathComparer.Equals(x.RepositoryRoot, group.Key))
-                    .OrderBy(x => x.DeclarationPath, PathComparer).ThenBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase).ToImmutableArray()))
+            .Select(group =>
+            {
+                var first = group.First();
+                var validationEntries = group.GroupBy(x => x.Path, PathComparer)
+                    .Select(x => x.First()).OrderBy(x => x.Path, PathComparer).ToArray();
+                return new RepositoryPlan(
+                    group.Key,
+                    validationEntries.Select(x => x.Path).ToImmutableArray(),
+                    uniqueEdits.Where(x => PathComparer.Equals(x.RepositoryRoot, group.Key))
+                        .OrderBy(x => x.DeclarationPath, PathComparer).ThenBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase).ToImmutableArray())
+                {
+                    ProjectsRoot = first.ProjectsRoot,
+                    ResolvedProjectsRoot = first.ResolvedProjectsRoot,
+                    ResolvedRepositoryRoot = first.ResolvedRepositoryRoot,
+                    ResolvedValidationTargets = validationEntries.Select(x => x.ResolvedPath).ToImmutableArray()
+                };
+            })
             .Where(x => x.Edits.Length > 0)
             .ToImmutableArray();
 
@@ -150,19 +170,25 @@ public sealed class UpgradePlanner
                     ? resolvedMinor
                     : current.Major == group.HighestCurrentMajor ? group.LatestMinor : null;
                 if (target is null || target.Value.CompareTo(current) <= 0) continue;
-                var repository = selected.FirstOrDefault(x =>
-                    x.ProjectPaths.Contains(occurrence.ProjectPath, PathComparer))?.RepositoryRoot;
-                if (repository is null) continue;
-                edits.Add(new(repository, occurrence.Declaration.Path, occurrence.PackageId,
-                    occurrence.CurrentVersion, target.Value.ToString(), occurrence.Declaration.Kind,
-                    occurrence.Declaration.Locator));
+                var entry = selected.FirstOrDefault(x =>
+                    x.ResolvedProjectPaths.Contains(occurrence.ResolvedProjectPath, PathComparer));
+                if (entry is null) continue;
+                edits.Add(new DeclarationEdit(entry.RepositoryRoot, occurrence.Declaration.Path,
+                    occurrence.PackageId, occurrence.CurrentVersion, target.Value.ToString(),
+                    occurrence.Declaration.Kind, occurrence.Declaration.Locator)
+                {
+                    ProjectsRoot = entry.ProjectsRoot,
+                    ResolvedProjectsRoot = entry.ResolvedProjectsRoot,
+                    ResolvedRepositoryRoot = entry.ResolvedRepositoryRoot,
+                    ResolvedDeclarationPath = occurrence.Declaration.ResolvedPath
+                });
             }
         }
         return UniqueEdits(edits);
     }
 
     private static DeclarationEdit[] UniqueEdits(IEnumerable<DeclarationEdit> edits) => edits
-        .GroupBy(x => (Path: NormalizePath(x.DeclarationPath), x.Locator), EditKeyComparer.Instance)
+        .GroupBy(x => (Path: NormalizePath(x.ResolvedDeclarationPath), x.Locator), EditKeyComparer.Instance)
         .Select(group =>
         {
             var targets = group.Select(x => x.TargetVersion).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();

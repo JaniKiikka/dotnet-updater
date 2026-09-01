@@ -98,9 +98,9 @@ Check that:
 - `.sln`, `.slnx`, or `.csproj` files exist below it;
 - each file is inside a Git repository whose root is also below the selected folder;
 - solution project paths are valid and remain inside the same repository; and
-- projects are not available only through a skipped symbolic link or excluded directory.
+- projects are not available only through a skipped symbolic-link directory or excluded directory. Explicit solution references through links are accepted only when their final real path stays inside the projects folder and owning repository.
 
-Discovery warnings identify unreadable paths, broken solution members, and entries outside Git repositories.
+Discovery warnings identify unreadable paths, broken solution members, link cycles, changed or unresolvable targets, and paths whose real targets escape the projects folder or repository.
 
 ### NuGet target resolution fails
 

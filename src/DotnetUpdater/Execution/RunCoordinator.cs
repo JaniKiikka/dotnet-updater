@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using DotnetUpdater.Domain;
+using DotnetUpdater.IO;
 
 namespace DotnetUpdater.Execution;
 
@@ -7,8 +8,11 @@ public sealed class RunCoordinator(
     IProcessRunner runner,
     GitService git,
     PackageEditor editor,
-    IRunLogger logger)
+    IRunLogger logger,
+    IRealPathContainment? containment = null)
 {
+    private readonly IRealPathContainment _containment = containment ?? new RealPathContainment();
+
     public async Task<ImmutableArray<RepositoryRunResult>> ExecuteAsync(
         UpgradePlan plan,
         IReadOnlyDictionary<string, RepositoryPreflight> preflight,
@@ -38,8 +42,10 @@ public sealed class RunCoordinator(
         CancellationToken token)
     {
         string? stash = null;
-        var root = repository.RepositoryRoot;
         var branch = PlannedBranch(plan);
+        if (!TryResolveRepository(repository, out var root, out var containmentError))
+            return Failed(repository, plan, branch, RunStage.Preflight, stash, null,
+                containmentError, progress);
 
         if (plan.Git.UpdatesCurrentBranch)
         {
@@ -263,22 +269,28 @@ public sealed class RunCoordinator(
         IProgress<ProgressEvent>? progress,
         CancellationToken token)
     {
-        foreach (var target in repository.ValidationTargets)
+        for (var index = 0; index < repository.ValidationTargets.Length; index++)
         {
+            if (!TryResolveValidationTarget(repository, index, out var target, out var containmentError))
+                return new(RunStage.Restore, containmentError);
             Emit(repository, RunStage.Restore, $"{phase}: restoring {Path.GetFileName(target)}", progress, packageId);
-            if (!(await Dotnet(repository.RepositoryRoot, token, "restore", target)).Succeeded)
+            if (!(await Dotnet(repository.ResolvedRepositoryRoot, token, "restore", target)).Succeeded)
                 return new(RunStage.Restore, $"Restore failed during {phase}. See the retained log.");
         }
-        foreach (var target in repository.ValidationTargets)
+        for (var index = 0; index < repository.ValidationTargets.Length; index++)
         {
+            if (!TryResolveValidationTarget(repository, index, out var target, out var containmentError))
+                return new(RunStage.Build, containmentError);
             Emit(repository, RunStage.Build, $"{phase}: building {Path.GetFileName(target)}", progress, packageId);
-            if (!(await Dotnet(repository.RepositoryRoot, token, "build", target, "--no-restore")).Succeeded)
+            if (!(await Dotnet(repository.ResolvedRepositoryRoot, token, "build", target, "--no-restore")).Succeeded)
                 return new(RunStage.Build, $"Build failed during {phase}. See the retained log.");
         }
-        foreach (var target in repository.ValidationTargets)
+        for (var index = 0; index < repository.ValidationTargets.Length; index++)
         {
+            if (!TryResolveValidationTarget(repository, index, out var target, out var containmentError))
+                return new(RunStage.Test, containmentError);
             Emit(repository, RunStage.Test, $"{phase}: testing {Path.GetFileName(target)}", progress, packageId);
-            if (!(await Dotnet(repository.RepositoryRoot, token, "test", target, "--no-build", "--no-restore")).Succeeded)
+            if (!(await Dotnet(repository.ResolvedRepositoryRoot, token, "test", target, "--no-build", "--no-restore")).Succeeded)
                 return new(RunStage.Test, $"Tests failed during {phase}. See the retained log.");
         }
         return null;
@@ -302,11 +314,15 @@ public sealed class RunCoordinator(
                 "Changes were left uncommitted.", changedPackages, packageResults);
         }
 
+        if (!TryResolveRepository(repository, out _, out var containmentError))
+            return Failed(repository, plan, branch, RunStage.Commit, stash, null,
+                containmentError, progress, changedPackages, packageResults);
+
         Emit(repository, RunStage.Commit, "Staging validated declaration files", progress);
-        if (!(await git.StageAsync(repository.RepositoryRoot, changedPaths.Distinct(PathComparer), token)).Succeeded)
+        if (!(await git.StageAsync(repository.ResolvedRepositoryRoot, changedPaths.Distinct(PathComparer), token)).Succeeded)
             return Failed(repository, plan, branch, RunStage.Commit, stash, null,
                 "Selective staging failed.", progress, changedPackages, packageResults);
-        var staged = await git.HasStagedChangesAsync(repository.RepositoryRoot, token);
+        var staged = await git.HasStagedChangesAsync(repository.ResolvedRepositoryRoot, token);
         if (staged.ExitCode == 0)
         {
             Emit(repository, RunStage.Skipped, "No package changes to commit", progress);
@@ -316,14 +332,14 @@ public sealed class RunCoordinator(
         if (staged.ExitCode != 1)
             return Failed(repository, plan, branch, RunStage.Commit, stash, null,
                 "Could not inspect staged changes.", progress, changedPackages, packageResults);
-        if (!(await git.CommitAsync(repository.RepositoryRoot, $"{branch} .NET nuget package update", token)).Succeeded)
+        if (!(await git.CommitAsync(repository.ResolvedRepositoryRoot, $"{branch} .NET nuget package update", token)).Succeeded)
             return Failed(repository, plan, branch, RunStage.Commit, stash, null,
                 "Commit failed.", progress, changedPackages, packageResults);
-        var head = await git.HeadAsync(repository.RepositoryRoot, token);
+        var head = await git.HeadAsync(repository.ResolvedRepositoryRoot, token);
         var commit = head.Succeeded ? head.StandardOutput.Trim() : null;
 
         Emit(repository, RunStage.Push, $"Pushing {plan.Git.RemoteName}/{branch}", progress);
-        if (!(await git.PushAsync(repository.RepositoryRoot, plan.Git.RemoteName, branch, token)).Succeeded)
+        if (!(await git.PushAsync(repository.ResolvedRepositoryRoot, plan.Git.RemoteName, branch, token)).Succeeded)
             return Failed(repository, plan, branch, RunStage.Push, stash, commit,
                 "Push failed; the local commit remains available.", progress, changedPackages, packageResults);
 
@@ -398,6 +414,70 @@ public sealed class RunCoordinator(
 
     private static string PlannedBranch(UpgradePlan plan) =>
         plan.Git.TargetBranch ?? plan.Git.BaseBranch ?? "current branch";
+
+    private bool TryResolveRepository(
+        RepositoryPlan repository,
+        out string resolvedRepository,
+        out string error)
+    {
+        resolvedRepository = string.Empty;
+        var projectsRoot = _containment.ResolveExisting(repository.ProjectsRoot);
+        var currentRepository = _containment.ResolveExisting(repository.RepositoryRoot);
+        if (!projectsRoot.Succeeded || !currentRepository.Succeeded)
+        {
+            error = $"Repository containment could not be rechecked. {projectsRoot.Error ?? currentRepository.Error}";
+            return false;
+        }
+        if (!_containment.PathsEqual(projectsRoot.ResolvedPath!, repository.ResolvedProjectsRoot) ||
+            !_containment.PathsEqual(currentRepository.ResolvedPath!, repository.ResolvedRepositoryRoot))
+        {
+            error = $"Repository or projects-folder target changed after planning: {repository.RepositoryRoot}.";
+            return false;
+        }
+        if (!_containment.IsWithin(projectsRoot.ResolvedPath!, currentRepository.ResolvedPath!))
+        {
+            error = $"Repository resolved target escapes the projects folder: {repository.RepositoryRoot} -> {currentRepository.ResolvedPath}.";
+            return false;
+        }
+        resolvedRepository = currentRepository.ResolvedPath!;
+        error = string.Empty;
+        return true;
+    }
+
+    private bool TryResolveValidationTarget(
+        RepositoryPlan repository,
+        int index,
+        out string resolvedTarget,
+        out string error)
+    {
+        resolvedTarget = string.Empty;
+        if (!TryResolveRepository(repository, out var repositoryRoot, out error)) return false;
+        var displayTarget = repository.ValidationTargets[index];
+        var plannedTarget = index < repository.ResolvedValidationTargets.Length
+            ? repository.ResolvedValidationTargets[index]
+            : displayTarget;
+        var projectsRoot = _containment.ResolveExisting(repository.ProjectsRoot);
+        var currentTarget = _containment.ResolveExisting(displayTarget);
+        if (!projectsRoot.Succeeded || !currentTarget.Succeeded)
+        {
+            error = $"Validation target real path could not be resolved: {displayTarget}. {currentTarget.Error ?? projectsRoot.Error}";
+            return false;
+        }
+        if (!_containment.PathsEqual(currentTarget.ResolvedPath!, plannedTarget))
+        {
+            error = $"Validation target changed after planning: {displayTarget} ({plannedTarget} -> {currentTarget.ResolvedPath}).";
+            return false;
+        }
+        if (!_containment.IsWithin(projectsRoot.ResolvedPath!, currentTarget.ResolvedPath!) ||
+            !_containment.IsWithin(repositoryRoot, currentTarget.ResolvedPath!))
+        {
+            error = $"Validation target escapes the projects folder or repository: {displayTarget} -> {currentTarget.ResolvedPath}.";
+            return false;
+        }
+        resolvedTarget = currentTarget.ResolvedPath!;
+        error = string.Empty;
+        return true;
+    }
 
     private static void Emit(
         RepositoryPlan repository,

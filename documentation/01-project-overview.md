@@ -33,7 +33,7 @@ The configured projects folder is scanned recursively for:
 - XML solution files (`.slnx`); and
 - standalone project files (`.csproj`) that are not already referenced by a discovered solution.
 
-Only entries inside a Git working tree are selectable. A repository root must also remain within the configured projects folder. Discovery skips common generated or tool-owned directories such as `.git`, `bin`, `obj`, `node_modules`, `.vs`, `.idea`, `.vscode`, `.cache`, and `.nuget`. Symbolic links are not traversed.
+Only entries inside a Git working tree are selectable. A repository root must also remain within the configured projects folder. Discovery skips common generated or tool-owned directories such as `.git`, `bin`, `obj`, `node_modules`, `.vs`, `.idea`, `.vscode`, `.cache`, and `.nuget`. Symbolic-link and reparse-point directories are not traversed during the recursive scan. An explicitly referenced solution project may pass through a link only when every component resolves successfully and the final target remains inside both the configured projects folder and the solution's repository. Escaping, broken, and cyclic links are rejected.
 
 ## Supported package declarations
 

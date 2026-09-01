@@ -1,11 +1,13 @@
 using System.Collections.Immutable;
 using System.Xml.Linq;
 using DotnetUpdater.Domain;
+using DotnetUpdater.IO;
 
 namespace DotnetUpdater.Discovery;
 
-public sealed class DiscoveryService
+public sealed class DiscoveryService(IRealPathContainment? containment = null)
 {
+    private readonly IRealPathContainment _containment = containment ?? new RealPathContainment();
     private static readonly HashSet<string> ExcludedDirectories = new(StringComparer.OrdinalIgnoreCase)
         { ".git", "bin", "obj", "node_modules", ".vs", ".idea", ".vscode", ".cache", ".nuget" };
 
@@ -15,6 +17,9 @@ public sealed class DiscoveryService
         var root = Canonicalize(projectsFolder);
         if (!Directory.Exists(root))
             return new([], [new(root, "Projects folder does not exist or is inaccessible.")]);
+        var resolvedRoot = _containment.ResolveExisting(root);
+        if (!resolvedRoot.Succeeded)
+            return new([], [new(root, $"Projects folder real path could not be resolved. {resolvedRoot.Error}")]);
 
         var candidates = new List<string>();
         var pending = new Stack<string>();
@@ -63,30 +68,57 @@ public sealed class DiscoveryService
                 warnings.Add(new(solution, "Solution is not inside a Git repository."));
                 continue;
             }
+            var resolvedRepository = _containment.ResolveExisting(repositoryRoot);
+            var resolvedSolution = _containment.ResolveExisting(solution);
+            if (!IsContained(resolvedRepository, resolvedRoot.ResolvedPath!, solution, resolvedSolution, warnings))
+                continue;
             var members = ReadSolutionProjects(solution, warnings)
                 .Select(path => Canonicalize(Path.Combine(Path.GetDirectoryName(solution)!, path)))
                 .Distinct(PathComparer).OrderBy(x => x, PathComparer).ToImmutableArray();
             var valid = ImmutableArray.CreateBuilder<string>();
+            var resolvedMembers = ImmutableArray.CreateBuilder<string>();
             foreach (var member in members)
             {
-                if (!IsWithin(repositoryRoot, member) || !File.Exists(member))
-                    warnings.Add(new(solution, $"Broken or out-of-repository project reference: {member}"));
-                else
-                {
-                    valid.Add(member);
-                    referencedProjects.Add(member);
-                }
+                var resolvedMember = _containment.ResolveExisting(member);
+                if (!IsContained(resolvedRepository, resolvedRoot.ResolvedPath!, solution,
+                        resolvedMember, warnings, member)) continue;
+
+                valid.Add(member);
+                resolvedMembers.Add(resolvedMember.ResolvedPath!);
+                referencedProjects.Add(member);
+                referencedProjects.Add(resolvedMember.ResolvedPath!);
             }
-            entries.Add(new(solution, repositoryRoot,
+            entries.Add(new SelectionEntry(solution, repositoryRoot,
                 solution.EndsWith(".slnx", StringComparison.OrdinalIgnoreCase) ? EntryKind.SolutionXml : EntryKind.Solution,
-                valid.ToImmutable()));
+                valid.ToImmutable())
+            {
+                ResolvedPath = resolvedSolution.ResolvedPath!,
+                ResolvedRepositoryRoot = resolvedRepository.ResolvedPath!,
+                ProjectsRoot = root,
+                ResolvedProjectsRoot = resolvedRoot.ResolvedPath!,
+                ResolvedProjectPaths = resolvedMembers.ToImmutable()
+            });
         }
 
         foreach (var project in projectCandidates.Except(referencedProjects, PathComparer).OrderBy(x => x, PathComparer))
         {
             var repositoryRoot = FindGitRoot(Path.GetDirectoryName(project)!, root);
             if (repositoryRoot is null) warnings.Add(new(project, "Project is not inside a Git repository."));
-            else entries.Add(new(project, repositoryRoot, EntryKind.StandaloneProject, [project]));
+            else
+            {
+                var resolvedRepository = _containment.ResolveExisting(repositoryRoot);
+                var resolvedProject = _containment.ResolveExisting(project);
+                if (IsContained(resolvedRepository, resolvedRoot.ResolvedPath!, project,
+                        resolvedProject, warnings))
+                    entries.Add(new SelectionEntry(project, repositoryRoot, EntryKind.StandaloneProject, [project])
+                    {
+                        ResolvedPath = resolvedProject.ResolvedPath!,
+                        ResolvedRepositoryRoot = resolvedRepository.ResolvedPath!,
+                        ProjectsRoot = root,
+                        ResolvedProjectsRoot = resolvedRoot.ResolvedPath!,
+                        ResolvedProjectPaths = [resolvedProject.ResolvedPath!]
+                    });
+            }
         }
 
         var repositories = entries.GroupBy(x => x.RepositoryRoot, PathComparer)
@@ -94,6 +126,35 @@ public sealed class DiscoveryService
             .Select(x => new RepositoryInfo(x.Key, x.OrderBy(e => e.Path, PathComparer).ToImmutableArray()))
             .ToImmutableArray();
         return new(repositories, warnings.OrderBy(x => x.Path, PathComparer).ToImmutableArray());
+    }
+
+    private bool IsContained(
+        RealPathResolution resolvedRepository,
+        string projectsRoot,
+        string warningPath,
+        RealPathResolution candidate,
+        ImmutableArray<DiscoveryWarning>.Builder warnings,
+        string? displayCandidate = null)
+    {
+        displayCandidate ??= candidate.DisplayPath;
+        if (!resolvedRepository.Succeeded)
+        {
+            warnings.Add(new(warningPath, $"Repository real path could not be resolved: {resolvedRepository.Error}"));
+            return false;
+        }
+        if (!candidate.Succeeded)
+        {
+            warnings.Add(new(warningPath, $"Skipped unresolvable path {displayCandidate}: {candidate.Error}"));
+            return false;
+        }
+        if (!_containment.IsWithin(projectsRoot, candidate.ResolvedPath!) ||
+            !_containment.IsWithin(resolvedRepository.ResolvedPath!, candidate.ResolvedPath!))
+        {
+            warnings.Add(new(warningPath,
+                $"Skipped path whose resolved target escapes the projects folder or repository: {displayCandidate} -> {candidate.ResolvedPath}"));
+            return false;
+        }
+        return true;
     }
 
     private static IEnumerable<string> ReadSolutionProjects(string solution, ImmutableArray<DiscoveryWarning>.Builder warnings)

@@ -105,7 +105,7 @@ DiscoveryResult
                            └─ RepositoryRunResult[]
 ```
 
-- `SelectionEntry` connects a selectable solution or project to its repository and member project paths.
+- `SelectionEntry` connects a selectable solution or project to its repository and member project paths while retaining distinct reviewed and resolved paths.
 - `PackageOccurrence` connects a package ID and current version to the exact XML declaration that owns it.
 - `PackageGroup` groups occurrences across selections and carries resolved minor and major targets.
 - `DeclarationEdit` records the reviewed old value, target value, XML location, and repository.
@@ -117,7 +117,7 @@ DiscoveryResult
 
 ### Plan before mutation
 
-Planning is separate from execution. The user reviews a stable `UpgradePlan`, and `PackageEditor.Validate` confirms immediately before mutation that every declaration still has the reviewed old value. This prevents silently applying a stale decision after a project file changes.
+Planning is separate from execution. The user reviews a stable `UpgradePlan`, and `PackageEditor.Validate` confirms immediately before mutation that every declaration still has the reviewed old value and resolves to the reviewed in-repository target. Discovery, inventory, preflight, validation commands, and mutation share the same cross-platform real-path containment policy. This prevents silently applying a stale decision after a file or linked path changes.
 
 ### Conservative XML editing
 

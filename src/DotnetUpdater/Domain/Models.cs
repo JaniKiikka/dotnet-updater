@@ -10,6 +10,11 @@ public sealed record SelectionEntry(
     EntryKind Kind,
     ImmutableArray<string> ProjectPaths)
 {
+    public string ResolvedPath { get; init; } = Path;
+    public string ResolvedRepositoryRoot { get; init; } = RepositoryRoot;
+    public string ProjectsRoot { get; init; } = RepositoryRoot;
+    public string ResolvedProjectsRoot { get; init; } = RepositoryRoot;
+    public ImmutableArray<string> ResolvedProjectPaths { get; init; } = ProjectPaths;
     public string DisplayName => System.IO.Path.GetFileName(Path);
 }
 
@@ -31,14 +36,20 @@ public sealed record PackageDeclaration(
     string PackageId,
     string CurrentVersion,
     DeclarationKind Kind,
-    string Locator);
+    string Locator)
+{
+    public string ResolvedPath { get; init; } = Path;
+}
 
 public sealed record PackageOccurrence(
     string PackageId,
     string CurrentVersion,
     string ProjectPath,
     PackageDeclaration Declaration,
-    string? UnsupportedReason = null);
+    string? UnsupportedReason = null)
+{
+    public string ResolvedProjectPath { get; init; } = ProjectPath;
+}
 
 public sealed record PackageGroup(
     string PackageId,
@@ -67,13 +78,23 @@ public sealed record DeclarationEdit(
     string TargetVersion,
     DeclarationKind Kind,
     string Locator,
-    bool IsForced = false);
+    bool IsForced = false)
+{
+    public string ProjectsRoot { get; init; } = RepositoryRoot;
+    public string ResolvedProjectsRoot { get; init; } = RepositoryRoot;
+    public string ResolvedRepositoryRoot { get; init; } = RepositoryRoot;
+    public string ResolvedDeclarationPath { get; init; } = DeclarationPath;
+}
 
 public sealed record RepositoryPlan(
     string RepositoryRoot,
     ImmutableArray<string> ValidationTargets,
     ImmutableArray<DeclarationEdit> Edits)
 {
+    public string ProjectsRoot { get; init; } = RepositoryRoot;
+    public string ResolvedProjectsRoot { get; init; } = RepositoryRoot;
+    public string ResolvedRepositoryRoot { get; init; } = RepositoryRoot;
+    public ImmutableArray<string> ResolvedValidationTargets { get; init; } = ValidationTargets;
     public ImmutableArray<ValidatedPackageUpdate> ValidatedUpdates { get; init; } = [];
 }
 

@@ -3,6 +3,7 @@ using DotnetUpdater.Configuration;
 using DotnetUpdater.Discovery;
 using DotnetUpdater.Domain;
 using DotnetUpdater.Execution;
+using DotnetUpdater.IO;
 using DotnetUpdater.Packages;
 using DotnetUpdater.Planning;
 using SharpConsoleUI;
@@ -32,15 +33,16 @@ public sealed class ConsoleApplication(
     {
         var logger = new FileRunLogger();
         var runner = new ProcessRunner(logger);
-        var editor = new PackageEditor();
+        var containment = new RealPathContainment();
+        var editor = new PackageEditor(containment);
         return new(
             new JsonConfigurationStore(new UserConfigurationPathProvider()),
-            new DiscoveryService(),
-            new PackageInventoryService(),
+            new DiscoveryService(containment),
+            new PackageInventoryService(containment),
             new NuGetVersionService(runner),
             new UpgradePlanner(),
-            new PreflightService(runner, editor),
-            new RunCoordinator(runner, new GitService(runner), editor, logger),
+            new PreflightService(runner, editor, containment),
+            new RunCoordinator(runner, new GitService(runner), editor, logger, containment),
             logger);
     }
 
