@@ -71,6 +71,14 @@ public sealed class ConsoleApplication(
             new NetConsoleDriver(RenderMode.Buffer),
             theme,
             options);
+
+        if (!OperatingSystem.IsWindows())
+        {
+            new ConsoleCancellationInput(
+                new SharpConsoleShortcutRegistry(windowSystem),
+                cancellation.Cancel).Register();
+        }
+        
         var flowSurface = Controls.Flow()
             .WithHorizontalAlignment(HorizontalAlignment.Stretch)
             .WithVerticalAlignment(VerticalAlignment.Fill)
@@ -695,7 +703,8 @@ public sealed class ConsoleApplication(
         "dotnet-updater\n\n" +
         "Keyboard-driven SharpConsoleUI application for NuGet upgrades across Git repositories.\n" +
         "Run without arguments. Use Tab to move focus, arrows to navigate, Space to toggle checkboxes, " +
-        "Enter to activate, and Esc to cancel a dialog. Ctrl+C requests cancellation between operations.");
+        "Enter to activate, and Esc to cancel a dialog. Ctrl+C requests cancellation from any screen; " +
+        "an active command is allowed to finish before the app exits with code 130.");
 
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;

@@ -790,6 +790,24 @@ public sealed class PresentationViewModelTests
     }
 }
 
+[TestClass]
+public sealed class ConsoleCancellationInputTests
+{
+    [TestMethod]
+    public void CtrlCRequestsCancellationAndConsumesTheKey()
+    {
+        var shortcuts = new RecordingShortcutRegistry();
+        using var cancellation = new CancellationTokenSource();
+        new ConsoleCancellationInput(shortcuts, cancellation.Cancel).Register();
+
+        Assert.AreEqual(ConsoleModifiers.Control, shortcuts.Modifiers);
+        Assert.AreEqual(ConsoleKey.C, shortcuts.Key);
+        Assert.IsNotNull(shortcuts.Handler);
+        Assert.IsTrue(shortcuts.Handler());
+        Assert.IsTrue(cancellation.IsCancellationRequested);
+    }
+}
+
 internal sealed class FixedPath(string path) : IConfigurationPathProvider
 {
     public string GetPath() => path;
@@ -888,5 +906,19 @@ internal sealed class RecordingAllVersionsSource(PackageVersionLookup response) 
     {
         Request = (projectPath, packageId);
         return Task.FromResult(response);
+    }
+}
+
+internal sealed class RecordingShortcutRegistry : IConsoleShortcutRegistry
+{
+    public ConsoleModifiers Modifiers { get; private set; }
+    public ConsoleKey Key { get; private set; }
+    public Func<bool>? Handler { get; private set; }
+
+    public void Register(ConsoleModifiers modifiers, ConsoleKey key, Func<bool> handler)
+    {
+        Modifiers = modifiers;
+        Key = key;
+        Handler = handler;
     }
 }

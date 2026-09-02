@@ -25,8 +25,6 @@ You will need the .NET 10 SDK, Git on `PATH`, and a modern terminal with 24-bit 
 dotnet run --project src/DotnetUpdater/DotnetUpdater.csproj
 ```
 
-Use `Tab` and `Shift+Tab` to move focus, the arrow keys to navigate, `Space` to toggle selections, and `Enter` to activate an item. `Esc` closes a dialog; `Ctrl+C` requests cancellation between operations.
-
 ## What it can update
 
 - `PackageReference Version="..."`
