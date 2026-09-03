@@ -190,8 +190,9 @@ public sealed class RunCoordinatorTests
         });
         var coordinator = new RunCoordinator(fake, new GitService(fake), new PackageEditor(),
             new FileRunLogger(Path.Combine(temp.Path, "logs")));
+        var progress = new RecordingProgress<ProgressEvent>();
 
-        var result = (await coordinator.ExecuteAsync(plan, Ready(temp.Path), null, default)).Single();
+        var result = (await coordinator.ExecuteAsync(plan, Ready(temp.Path), progress, default)).Single();
 
         Assert.AreEqual(RunStage.Passed, result.Status);
         Assert.AreEqual(PackageUpdateStatus.Failed,
@@ -200,6 +201,8 @@ public sealed class RunCoordinatorTests
         StringAssert.Contains(final, "Broken.Package\" Version=\"1.0.0");
         StringAssert.Contains(final, "Working.Package\" Version=\"2.0.0");
         Assert.IsFalse(result.ChangedPackages.Any(x => x.PackageId == "Broken.Package"));
+        Assert.IsTrue(progress.Messages.Any(x =>
+            x.PackageId == "Broken.Package" && x.PackageStatus == PackageUpdateStatus.Failed));
     }
 
     private static DeclarationEdit Edit(string root, string project, string packageId, string oldVersion, string targetVersion) =>

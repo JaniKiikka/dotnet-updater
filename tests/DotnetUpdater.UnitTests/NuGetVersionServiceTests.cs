@@ -27,7 +27,7 @@ public sealed class NuGetVersionServiceTests
             return new[] { occurrence }.GroupBy(x => x.PackageId, StringComparer.OrdinalIgnoreCase).Single();
         }).ToArray();
         var runner = new ConcurrencyTrackingRunner(TimeSpan.FromMilliseconds(25));
-        var progress = new RecordingProgress();
+        var progress = new RecordingProgress<string>();
 
         var resolved = await new NuGetVersionService(runner).ResolveAllAsync(groups, progress, default, maxConcurrency: 3);
 
@@ -277,4 +277,3 @@ public sealed class NuGetVersionServiceTests
             new(project, packageId, version, DeclarationKind.PackageReferenceAttribute,
                 $"PackageReference:{packageId}:attribute"));
 }
-

@@ -498,6 +498,93 @@ internal sealed class PackageDecisionContent : IFlowStepContent<ManualDecisionSe
     }
 }
 
+internal sealed class RepositoryProgressContent(
+    ConsoleWindowSystem windowSystem,
+    RepositoryProgressViewModel viewModel) : IFlowStepContent<ImmutableArray<RepositoryRunResult>>, IProgress<ProgressEvent>
+{
+    private readonly TaskCompletionSource<ImmutableArray<RepositoryRunResult>> completion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private MarkupControl? summary;
+    private MarkupControl? rows;
+    private MarkupControl? active;
+
+    public Task<ImmutableArray<RepositoryRunResult>> Completion => completion.Task;
+    public event Action? StateChanged;
+
+    public IWindowControl BuildContent(FlowChrome chrome)
+    {
+        summary = Ctl.Markup().WithMargin(1, 0, 1, 0).Build();
+        rows = Ctl.Markup().WithMargin(1, 0, 1, 0).Build();
+        active = Ctl.Markup().WithMargin(1, 0, 1, 0).Build();
+
+        var repositoryPanel = TuiChrome.ScrollableBody();
+        repositoryPanel.AddControl(rows);
+
+        var content = Ctl.Grid()
+            .Columns([GridLength.Star()])
+            .Rows([
+                GridLength.Auto(),
+                GridLength.Cells(1),
+                GridLength.Star(),
+                GridLength.Cells(1),
+                GridLength.Auto()
+            ])
+            .Place(summary, 0, 0)
+            .Place(Ctl.RuleBuilder().WithColorRole(ColorRole.Secondary).Build(), 1, 0)
+            .Place(repositoryPanel, 2, 0)
+            .Place(Ctl.RuleBuilder().WithColorRole(ColorRole.Secondary).Build(), 3, 0)
+            .Place(active, 4, 0)
+            .WithAlignment(HorizontalAlignment.Stretch)
+            .WithVerticalAlignment(VerticalAlignment.Fill)
+            .Build();
+
+        Render();
+        return content;
+    }
+
+    public void Report(ProgressEvent value)
+    {
+        viewModel.Apply(value);
+        RequestRender();
+    }
+
+    public void Complete(ImmutableArray<RepositoryRunResult> results)
+    {
+        RequestRender();
+        completion.TrySetResult(results);
+    }
+
+    public void Cancel()
+    {
+        viewModel.CancelIncomplete();
+        RequestRender();
+        completion.TrySetCanceled();
+    }
+
+    public void Fail(Exception error) => completion.TrySetException(error);
+
+    private void RequestRender()
+    {
+        if (summary is null) return;
+        if (windowSystem.IsRunning && !windowSystem.IsOnUIThread)
+        {
+            windowSystem.EnqueueOnUIThread(Render, "repository progress update");
+            return;
+        }
+        Render();
+    }
+
+    private void Render()
+    {
+        if (summary is null || rows is null || active is null) return;
+        var snapshot = viewModel.Snapshot();
+        summary.SetContent(PresentationText.ProgressSummary(snapshot).Split('\n').ToList());
+        rows.SetContent(PresentationText.ProgressRows(snapshot).Split('\n').ToList());
+        active.SetContent(PresentationText.ActiveProgress(snapshot).Split('\n').ToList());
+        StateChanged?.Invoke();
+    }
+}
+
 internal sealed class ScrollableMessageContent : IFlowStepContent<bool>
 {
     private readonly TaskCompletionSource<bool> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);

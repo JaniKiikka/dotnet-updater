@@ -371,26 +371,40 @@ public sealed class ConsoleApplication(
 
         var byRoot = inspected.ToDictionary(x => x.RepositoryRoot, PathComparer);
         var progressViewModel = new RepositoryProgressViewModel(plan.Repositories.Select(x => x.RepositoryRoot));
-        var results = await context.RunWithProgress(
-            "Upgrading repositories",
-            $"0 of {plan.Repositories.Length} repositories complete…",
-            async (token, progress) =>
-            {
-                var terminalCount = 0;
-                var gate = new object();
-                var reporter = new ImmediateProgress<ProgressEvent>(value =>
-                {
-                    lock (gate)
-                    {
-                        progressViewModel.Apply(value);
-                        if (value.Stage is RunStage.Passed or RunStage.Failed or RunStage.Skipped) terminalCount++;
-                        progress.Report(
-                            $"{terminalCount} of {plan.Repositories.Length} complete · " +
-                            $"{Path.GetFileName(value.RepositoryRoot)}: {value.Stage} — {value.Message}");
-                    }
-                });
-                return await coordinator.ExecuteAsync(plan, byRoot, reporter, token).ConfigureAwait(false);
-            }).ConfigureAwait(false);
+        var progressContent = new RepositoryProgressContent(windowSystem, progressViewModel);
+        var presentationTask = mainHost.PresentAsync(
+            progressContent,
+            new FlowChrome("Upgrading repositories", widthHint: 110, heightHint: 34),
+            cancellationToken);
+        ImmutableArray<RepositoryRunResult> executionResults;
+        try
+        {
+            executionResults = await coordinator.ExecuteAsync(
+                plan,
+                byRoot,
+                progressContent,
+                cancellationToken).ConfigureAwait(false);
+            progressContent.Complete(executionResults);
+        }
+        catch (OperationCanceledException)
+        {
+            progressContent.Cancel();
+            try { _ = await presentationTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            throw;
+        }
+        catch (Exception error)
+        {
+            progressContent.Fail(error);
+            try { _ = await presentationTask.ConfigureAwait(false); }
+            catch { }
+            throw;
+        }
+
+        var progressOutcome = await presentationTask.ConfigureAwait(false);
+        var results = progressOutcome.Verdict == FlowVerdict.Cancel
+            ? default
+            : progressOutcome.Value;
         if (results.IsDefault) throw new OperationCanceledException();
 
         await ShowMessageAsync(
@@ -709,8 +723,4 @@ public sealed class ConsoleApplication(
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
-    private sealed class ImmediateProgress<T>(Action<T> report) : IProgress<T>
-    {
-        public void Report(T value) => report(value);
-    }
 }

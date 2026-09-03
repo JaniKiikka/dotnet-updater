@@ -1,5 +1,10 @@
 namespace DotnetUpdater.UnitTests;
 
+using SharpConsoleUI;
+using SharpConsoleUI.Configuration;
+using SharpConsoleUI.Drivers;
+using SharpConsoleUI.Flows;
+
 [TestClass]
 public sealed class PresentationViewModelTests
 {
@@ -60,17 +65,102 @@ public sealed class PresentationViewModelTests
     }
 
     [TestMethod]
-    public void RepositoryProgressRetainsOneTextLabeledRowPerRepository()
+    public void RepositoryProgressRetainsOrderedMixedStatesAndCountsFailures()
     {
-        var progress = new RepositoryProgressViewModel(["/repos/one", "/repos/two"]);
-        progress.Apply(new("/repos/one", RunStage.Build, "Building One.slnx"));
-        progress.Apply(new("/repos/two", RunStage.Failed, "Failed at Test"));
+        var progress = new RepositoryProgressViewModel([
+            "/repos/zeta",
+            "/repos/active",
+            "/repos/passed",
+            "/repos/failed",
+            "/repos/skipped",
+            "/repos/queued"
+        ]);
+        progress.Apply(new("/repos/zeta", RunStage.Cancelled, "Cancelled by user"));
+        progress.Apply(new("/repos/passed", RunStage.Passed, "Passed"));
+        progress.Apply(new("/repos/failed", RunStage.Failed, "Failed at Test"));
+        progress.Apply(new("/repos/skipped", RunStage.Skipped, "Preflight blocked"));
+        progress.Apply(new("/repos/active", RunStage.ApplyUpdates, "Could not update Old.Package", "Old.Package",
+            PackageUpdateStatus.Failed));
+        progress.Apply(new("/repos/active", RunStage.Build, "Example.Package 8.0.0: building App.slnx", "Example.Package"));
 
-        var text = PresentationText.Progress(progress.Snapshot());
+        var snapshot = progress.Snapshot();
+        var text = PresentationText.Progress(snapshot);
 
-        StringAssert.Contains(text, "one");
-        StringAssert.Contains(text, "Building");
-        StringAssert.Contains(text, "two");
-        StringAssert.Contains(text, "Failed");
+        CollectionAssert.AreEqual(
+            new[] { "zeta", "active", "passed", "failed", "skipped", "queued" },
+            snapshot.Repositories.Select(x => Path.GetFileName(x.RepositoryRoot)).ToArray());
+        Assert.AreEqual(1, snapshot.PassedCount);
+        Assert.AreEqual(1, snapshot.FailedCount);
+        Assert.AreEqual(1, snapshot.SkippedCount);
+        Assert.AreEqual(1, snapshot.QueuedCount);
+        Assert.AreEqual(1, snapshot.CancelledCount);
+        Assert.AreEqual(1, snapshot.FailedPackageCount);
+        Assert.AreEqual("Example.Package", snapshot.Active?.PackageId);
+        StringAssert.Contains(text, "[PASSED] passed");
+        StringAssert.Contains(text, "[FAILED] failed");
+        StringAssert.Contains(text, "[SKIPPED] skipped");
+        StringAssert.Contains(text, "[QUEUED] queued");
+        StringAssert.Contains(text, "[CANCELLED] zeta");
+        StringAssert.Contains(text, "Phase:[/] Building");
+        StringAssert.Contains(text, "Package:[/] Example.Package");
+        StringAssert.Contains(text, "Command/status:[/] Example.Package 8.0.0: building App.slnx");
+        StringAssert.Contains(text, "Failed packages:[/] 1");
+    }
+
+    [TestMethod]
+    public void RepositoryProgressDoesNotOverwriteTerminalRowsAndCancelsIncompleteRows()
+    {
+        var progress = new RepositoryProgressViewModel(["/repos/one", "/repos/two", "/repos/three"]);
+        progress.Apply(new("/repos/one", RunStage.Failed, "Tests failed"));
+        progress.Apply(new("/repos/one", RunStage.Build, "Late event must be ignored"));
+        progress.Apply(new("/repos/two", RunStage.Build, "Building"));
+        progress.CancelIncomplete();
+
+        var snapshot = progress.Snapshot();
+
+        Assert.AreEqual(RunStage.Failed, snapshot.Repositories[0].Stage);
+        Assert.AreEqual("Tests failed", snapshot.Repositories[0].Message);
+        Assert.AreEqual(RunStage.Cancelled, snapshot.Repositories[1].Stage);
+        Assert.AreEqual(RunStage.Cancelled, snapshot.Repositories[2].Stage);
+        Assert.AreEqual(2, snapshot.CancelledCount);
+        Assert.IsNull(snapshot.Active);
+    }
+
+    [TestMethod]
+    public void RepositoryProgressRendersRetainedRowsAtEightyByTwentyFour()
+    {
+        using var driver = new HeadlessConsoleDriver(80, 24);
+        var windowSystem = new ConsoleWindowSystem(
+            driver,
+            new ConsoleWindowSystemOptions(InstallSynchronizationContext: false));
+        var progress = new RepositoryProgressViewModel([
+            "/repos/one", "/repos/two", "/repos/three", "/repos/four", "/repos/five"
+        ]);
+        var content = new RepositoryProgressContent(windowSystem, progress);
+        var window = new Window(windowSystem)
+        {
+            Width = 80,
+            Height = 24,
+            Title = "Repository progress"
+        };
+        window.AddControl(content.BuildContent(new FlowChrome("Repository progress", widthHint: 80, heightHint: 24)));
+        windowSystem.AddWindow(window);
+
+        content.Report(new("/repos/one", RunStage.Passed, "Passed"));
+        content.Report(new("/repos/two", RunStage.Failed, "Tests failed"));
+        content.Report(new("/repos/three", RunStage.Skipped, "Preflight blocked"));
+        content.Report(new("/repos/four", RunStage.Build, "Building App.slnx", "Example.Package"));
+
+        var rendered = System.Text.RegularExpressions.Regex.Replace(
+            string.Join('\n', window.RenderAndGetVisibleContent(null)),
+            "\u001b\\[[0-9;]*m",
+            string.Empty);
+
+        StringAssert.Contains(rendered, "[PASSED] one");
+        StringAssert.Contains(rendered, "[FAILED] two");
+        StringAssert.Contains(rendered, "[SKIPPED] three");
+        StringAssert.Contains(rendered, "[RUNNING] four");
+        StringAssert.Contains(rendered, "[QUEUED] five");
+        StringAssert.Contains(rendered, "Command/status: Building App.slnx");
     }
 }

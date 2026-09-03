@@ -197,18 +197,97 @@ public sealed class PackageDecisionViewModel
     }
 }
 
-public sealed class RepositoryProgressViewModel(IEnumerable<string> repositoryRoots)
+public sealed record RepositoryProgressSnapshot(
+    ImmutableArray<ProgressEvent> Repositories,
+    ProgressEvent? Active,
+    int PassedCount,
+    int FailedCount,
+    int SkippedCount,
+    int QueuedCount,
+    int CancelledCount,
+    int FailedPackageCount)
 {
-    private readonly Dictionary<string, ProgressEvent> events = repositoryRoots.ToDictionary(
-        x => x,
-        x => new ProgressEvent(x, RunStage.Queued, "Waiting"),
-        PathComparer);
+    public int TotalCount => Repositories.Length;
+    public int CompleteCount => PassedCount + FailedCount + SkippedCount + CancelledCount;
+}
 
-    public void Apply(ProgressEvent value) => events[value.RepositoryRoot] = value;
+public sealed class RepositoryProgressViewModel
+{
+    private readonly object gate = new();
+    private readonly ImmutableArray<string> repositoryRoots;
+    private readonly Dictionary<string, ProgressEvent> events;
+    private readonly Dictionary<string, HashSet<string>> failedPackages;
+    private string? activeRepositoryRoot;
 
-    public ImmutableArray<ProgressEvent> Snapshot() => events.Values
-        .OrderBy(x => x.RepositoryRoot, PathComparer)
-        .ToImmutableArray();
+    public RepositoryProgressViewModel(IEnumerable<string> repositoryRoots)
+    {
+        var seen = new HashSet<string>(PathComparer);
+        this.repositoryRoots = repositoryRoots
+            .Where(seen.Add)
+            .ToImmutableArray();
+        events = this.repositoryRoots.ToDictionary(
+            x => x,
+            x => new ProgressEvent(x, RunStage.Queued, "Waiting"),
+            PathComparer);
+        failedPackages = this.repositoryRoots.ToDictionary(
+            x => x,
+            _ => new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            PathComparer);
+    }
+
+    public void Apply(ProgressEvent value)
+    {
+        lock (gate)
+        {
+            if (!events.TryGetValue(value.RepositoryRoot, out var current)) return;
+            if (IsTerminal(current.Stage)) return;
+
+            events[value.RepositoryRoot] = value;
+            if (value.PackageStatus == PackageUpdateStatus.Failed && value.PackageId is not null)
+                failedPackages[value.RepositoryRoot].Add(value.PackageId);
+
+            if (!IsTerminal(value.Stage))
+                activeRepositoryRoot = value.RepositoryRoot;
+            else if (activeRepositoryRoot is not null && PathComparer.Equals(activeRepositoryRoot, value.RepositoryRoot))
+                activeRepositoryRoot = null;
+        }
+    }
+
+    public void CancelIncomplete(string message = "Cancelled before completion")
+    {
+        lock (gate)
+        {
+            foreach (var root in repositoryRoots)
+            {
+                if (IsTerminal(events[root].Stage)) continue;
+                events[root] = new(root, RunStage.Cancelled, message);
+            }
+            activeRepositoryRoot = null;
+        }
+    }
+
+    public RepositoryProgressSnapshot Snapshot()
+    {
+        lock (gate)
+        {
+            var repositories = repositoryRoots.Select(x => events[x]).ToImmutableArray();
+            var active = activeRepositoryRoot is not null && events.TryGetValue(activeRepositoryRoot, out var current)
+                ? current
+                : null;
+            return new(
+                repositories,
+                active,
+                repositories.Count(x => x.Stage == RunStage.Passed),
+                repositories.Count(x => x.Stage == RunStage.Failed),
+                repositories.Count(x => x.Stage == RunStage.Skipped),
+                repositories.Count(x => x.Stage == RunStage.Queued),
+                repositories.Count(x => x.Stage == RunStage.Cancelled),
+                failedPackages.Values.Sum(x => x.Count));
+        }
+    }
+
+    private static bool IsTerminal(RunStage stage) =>
+        stage is RunStage.Passed or RunStage.Failed or RunStage.Skipped or RunStage.Cancelled;
 
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;

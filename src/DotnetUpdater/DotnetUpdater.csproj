@@ -10,4 +10,7 @@
     <PackageReference Include="NuGet.Protocol" Version="7.9.0" />
     <PackageReference Include="SharpConsoleUI" Version="2.6.2" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="DotnetUpdater.UnitTests" />
+  </ItemGroup>
 </Project>

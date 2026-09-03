@@ -106,28 +106,29 @@ public enum UpgradeStrategy { Batch, ValidatedIncremental }
 public enum RunStage
 {
     Queued, Preflight, Stash, SwitchBranch, Synchronize, CreateBranch,
-    ApplyUpdates, Restore, Build, Test, Commit, Push, Passed, Failed, Skipped
+    ApplyUpdates, Restore, Build, Test, Commit, Push, Passed, Failed, Skipped, Cancelled
 }
 
 public sealed class RepositoryStateMachine
 {
     private static readonly IReadOnlyDictionary<RunStage, RunStage[]> LegalTransitions = new Dictionary<RunStage, RunStage[]>
     {
-        [RunStage.Queued] = [RunStage.Preflight],
-        [RunStage.Preflight] = [RunStage.Stash, RunStage.Skipped],
-        [RunStage.Stash] = [RunStage.SwitchBranch, RunStage.CreateBranch, RunStage.ApplyUpdates, RunStage.Failed],
-        [RunStage.SwitchBranch] = [RunStage.Synchronize, RunStage.Failed],
-        [RunStage.Synchronize] = [RunStage.CreateBranch, RunStage.ApplyUpdates, RunStage.Failed],
-        [RunStage.CreateBranch] = [RunStage.ApplyUpdates, RunStage.Failed],
-        [RunStage.ApplyUpdates] = [RunStage.Restore, RunStage.Skipped, RunStage.Failed],
-        [RunStage.Restore] = [RunStage.Restore, RunStage.Build, RunStage.Failed],
-        [RunStage.Build] = [RunStage.Build, RunStage.Test, RunStage.Failed],
-        [RunStage.Test] = [RunStage.Test, RunStage.Commit, RunStage.Passed, RunStage.Failed],
-        [RunStage.Commit] = [RunStage.Push, RunStage.Skipped, RunStage.Failed],
-        [RunStage.Push] = [RunStage.Passed, RunStage.Failed],
+        [RunStage.Queued] = [RunStage.Preflight, RunStage.Cancelled],
+        [RunStage.Preflight] = [RunStage.Stash, RunStage.Skipped, RunStage.Cancelled],
+        [RunStage.Stash] = [RunStage.SwitchBranch, RunStage.CreateBranch, RunStage.ApplyUpdates, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.SwitchBranch] = [RunStage.Synchronize, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Synchronize] = [RunStage.CreateBranch, RunStage.ApplyUpdates, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.CreateBranch] = [RunStage.ApplyUpdates, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.ApplyUpdates] = [RunStage.Restore, RunStage.Skipped, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Restore] = [RunStage.Restore, RunStage.Build, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Build] = [RunStage.Build, RunStage.Test, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Test] = [RunStage.Test, RunStage.Commit, RunStage.Passed, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Commit] = [RunStage.Push, RunStage.Skipped, RunStage.Failed, RunStage.Cancelled],
+        [RunStage.Push] = [RunStage.Passed, RunStage.Failed, RunStage.Cancelled],
         [RunStage.Passed] = [],
         [RunStage.Failed] = [],
-        [RunStage.Skipped] = []
+        [RunStage.Skipped] = [],
+        [RunStage.Cancelled] = []
     };
 
     public RunStage Current { get; private set; } = RunStage.Queued;
@@ -145,7 +146,12 @@ public sealed record RepositoryPreflight(
     bool IsReady,
     ImmutableArray<PreflightIssue> Issues);
 
-public sealed record ProgressEvent(string RepositoryRoot, RunStage Stage, string Message, string? PackageId = null);
+public sealed record ProgressEvent(
+    string RepositoryRoot,
+    RunStage Stage,
+    string Message,
+    string? PackageId = null,
+    PackageUpdateStatus? PackageStatus = null);
 
 public sealed record ChangedPackage(string PackageId, string OldVersion, string TargetVersion);
 

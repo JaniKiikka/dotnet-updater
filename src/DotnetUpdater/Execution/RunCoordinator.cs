@@ -154,8 +154,13 @@ public sealed class RunCoordinator(
             if (validation is not null)
             {
                 foreach (var update in firstParty)
+                {
                     packageResults.Add(new(update.PackageId, PackageUpdateStatus.Failed, null,
                         "The Microsoft first-party batch did not pass validation."));
+                    Emit(repository, RunStage.ApplyUpdates,
+                        $"Microsoft first-party validation failed for {update.PackageId}", progress, update.PackageId,
+                        PackageUpdateStatus.Failed);
+                }
                 if (!Rollback(edits, out var rollbackError))
                     return Failed(repository, plan, branch, RunStage.ApplyUpdates, stash, null,
                         $"{validation.Message} Rollback also failed: {rollbackError}", progress,
@@ -212,7 +217,8 @@ public sealed class RunCoordinator(
                         ? "The forced version failed validation; the working version was restored."
                         : "The major version failed and no distinct minor update was available; the working version was restored."));
                 Emit(repository, RunStage.ApplyUpdates,
-                    $"Could not update {update.PackageId}; restored its working version", progress, update.PackageId);
+                    $"Could not update {update.PackageId}; restored its working version", progress, update.PackageId,
+                    PackageUpdateStatus.Failed);
                 continue;
             }
 
@@ -242,7 +248,8 @@ public sealed class RunCoordinator(
             packageResults.Add(new(update.PackageId, PackageUpdateStatus.Failed, null,
                 "Both major and minor updates failed validation; the working version was restored."));
             Emit(repository, RunStage.ApplyUpdates,
-                $"Could not update {update.PackageId}; restored its working version", progress, update.PackageId);
+                $"Could not update {update.PackageId}; restored its working version", progress, update.PackageId,
+                PackageUpdateStatus.Failed);
         }
 
         if (acceptedChanges.Count == 0)
@@ -404,8 +411,9 @@ public sealed class RunCoordinator(
         RunStage stage,
         string message,
         IProgress<ProgressEvent>? progress,
-        string? packageId = null) =>
-        progress?.Report(new(repository.RepositoryRoot, stage, message, packageId));
+        string? packageId = null,
+        PackageUpdateStatus? packageStatus = null) =>
+        progress?.Report(new(repository.RepositoryRoot, stage, message, packageId, packageStatus));
 
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;

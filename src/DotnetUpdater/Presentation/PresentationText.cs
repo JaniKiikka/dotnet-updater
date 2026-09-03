@@ -74,21 +74,47 @@ public static class PresentationText
         return string.Join('\n', lines);
     }
 
-    public static string Progress(IEnumerable<ProgressEvent> events)
+    public static string Progress(RepositoryProgressSnapshot snapshot) =>
+        $"{ProgressSummary(snapshot)}\n\n{ProgressRows(snapshot)}\n\n{ActiveProgress(snapshot)}";
+
+    public static string ProgressSummary(RepositoryProgressSnapshot snapshot)
     {
-        return string.Join('\n', events.Select(value =>
+        var runningCount = snapshot.TotalCount - snapshot.CompleteCount - snapshot.QueuedCount;
+        return $"[bold]Repositories:[/] {snapshot.CompleteCount}/{snapshot.TotalCount} complete · " +
+            $"[green]PASSED {snapshot.PassedCount}[/] · " +
+            $"[red]FAILED {snapshot.FailedCount}[/] · " +
+            $"[yellow]SKIPPED {snapshot.SkippedCount}[/] · " +
+            $"[cyan]RUNNING {runningCount}[/] · " +
+            $"[dim]QUEUED {snapshot.QueuedCount}[/] · " +
+            $"[#C084FC]CANCELLED {snapshot.CancelledCount}[/]\n" +
+            $"[bold]Failed packages:[/] {snapshot.FailedPackageCount}";
+    }
+
+    public static string ProgressRows(RepositoryProgressSnapshot snapshot)
+    {
+        return string.Join('\n', snapshot.Repositories.Select(value =>
         {
-            var (icon, color) = value.Stage switch
-            {
-                RunStage.Passed => ("✓", "green"),
-                RunStage.Failed => ("✗", "red"),
-                RunStage.Skipped => ("○", "yellow"),
-                RunStage.Queued => ("·", "dim"),
-                _ => ("◆", "cyan")
-            };
-            return $"[{color}]{icon} {Escape(Path.GetFileName(value.RepositoryRoot))}[/]  " +
-                $"{StageLabel(value.Stage)} — {Escape(value.Message)}";
+            var (icon, color, status) = ProgressStyle(value.Stage);
+            var package = value.PackageId is null
+                ? string.Empty
+                : $" · Package: {Escape(value.PackageId)}";
+            return $"[{color}]{icon} [{status}] {Escape(Path.GetFileName(value.RepositoryRoot))}[/] · " +
+                $"{StageLabel(value.Stage)}{package} — {Escape(value.Message)}";
         }));
+    }
+
+    public static string ActiveProgress(RepositoryProgressSnapshot snapshot)
+    {
+        if (snapshot.Active is not { } active)
+            return "[bold]Active:[/] none\n[dim]Use ↑/↓ or Page Up/Page Down to scroll repositories. Ctrl+C cancels.[/]";
+
+        var package = active.PackageId is null
+            ? string.Empty
+            : $" · [bold]Package:[/] {Escape(active.PackageId)}";
+        return $"[bold]Active:[/] {Escape(Path.GetFileName(active.RepositoryRoot))} · " +
+            $"[bold]Phase:[/] {StageLabel(active.Stage)}{package}\n" +
+            $"[bold]Command/status:[/] {Escape(active.Message)}\n" +
+            "[dim]Use ↑/↓ or Page Up/Page Down to scroll repositories. Ctrl+C cancels.[/]";
     }
 
     public static string Summary(ImmutableArray<RepositoryRunResult> results)
@@ -141,6 +167,16 @@ public static class PresentationText
         RunStage.Commit => "Committing",
         RunStage.Push => "Pushing",
         _ => stage.ToString()
+    };
+
+    private static (string Icon, string Color, string Status) ProgressStyle(RunStage stage) => stage switch
+    {
+        RunStage.Passed => ("✓", "green", "PASSED"),
+        RunStage.Failed => ("✗", "red", "FAILED"),
+        RunStage.Skipped => ("○", "yellow", "SKIPPED"),
+        RunStage.Queued => ("·", "dim", "QUEUED"),
+        RunStage.Cancelled => ("×", "#C084FC", "CANCELLED"),
+        _ => ("◆", "cyan", "RUNNING")
     };
 
     public static string Escape(string value) => MarkupParser.Escape(value);

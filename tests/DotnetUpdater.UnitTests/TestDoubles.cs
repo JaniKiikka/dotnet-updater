@@ -68,12 +68,12 @@ internal sealed class ConcurrencyTrackingRunner(TimeSpan delay) : IProcessRunner
     }
 }
 
-internal sealed class RecordingProgress : IProgress<string>
+internal sealed class RecordingProgress<T> : IProgress<T>
 {
     private readonly object _gate = new();
-    private readonly List<string> _messages = [];
+    private readonly List<T> _messages = [];
 
-    public IReadOnlyList<string> Messages
+    public IReadOnlyList<T> Messages
     {
         get
         {
@@ -81,7 +81,7 @@ internal sealed class RecordingProgress : IProgress<string>
         }
     }
 
-    public void Report(string value)
+    public void Report(T value)
     {
         lock (_gate) _messages.Add(value);
     }
