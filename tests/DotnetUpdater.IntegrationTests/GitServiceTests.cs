@@ -1,6 +1,3 @@
-using DotnetUpdater.Execution;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-
 namespace DotnetUpdater.IntegrationTests;
 
 [TestClass]
@@ -101,3 +98,4 @@ public sealed class GitServiceTests
         return result;
     }
 }
+
