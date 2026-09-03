@@ -76,6 +76,49 @@ public sealed class UpgradePlannerTests
     }
 
     [TestMethod]
+    public void AllNoUpdateDecisionsProduceNoRepositories()
+    {
+        var (entry, group) = SinglePackage("1.0.0", new(1, 1, 0), new(2, 0, 0));
+        var decisions = new Dictionary<string, PackageDecision>
+        {
+            [group.PackageId] = new(group.PackageId, UpgradeChoice.NoUpdate, null)
+        };
+
+        var plan = new UpgradePlanner().Create(
+            [entry], [group], decisions, new("origin", null, null, false), DateTimeOffset.UnixEpoch);
+
+        Assert.IsEmpty(plan.Repositories);
+    }
+
+    [TestMethod]
+    public void AlreadyCurrentAutomaticTargetProducesNoRepositories()
+    {
+        var (entry, group) = SinglePackage("2.0.0", new(2, 0, 0), new(2, 0, 0));
+        var decision = UpgradePlanner.AutomaticDecision(group, UpgradeChoice.LatestMajor);
+
+        var plan = new UpgradePlanner().Create(
+            [entry], [group], new Dictionary<string, PackageDecision> { [group.PackageId] = decision },
+            new("origin", null, null, false), DateTimeOffset.UnixEpoch);
+
+        Assert.IsEmpty(plan.Repositories);
+    }
+
+    [TestMethod]
+    public void UnavailableAutomaticTargetProducesNoRepositories()
+    {
+        var (entry, original) = SinglePackage("1.0.0", null, null);
+        var group = original with { ResolutionError = "NuGet source unavailable" };
+        var decision = UpgradePlanner.AutomaticDecision(group, UpgradeChoice.LatestMajor);
+
+        var plan = new UpgradePlanner().Create(
+            [entry], [group], new Dictionary<string, PackageDecision> { [group.PackageId] = decision },
+            new("origin", null, null, false), DateTimeOffset.UnixEpoch);
+
+        Assert.AreEqual(UpgradeChoice.NoUpdate, decision.Choice);
+        Assert.IsEmpty(plan.Repositories);
+    }
+
+    [TestMethod]
     public void ValidatedIncrementalPlanSeparatesMicrosoftPackagesAndKeepsMinorFallbacks()
     {
         using var temp = new TempDirectory();
@@ -143,4 +186,15 @@ public sealed class UpgradePlannerTests
         new(packageId, version, project,
             new(project, packageId, version, DeclarationKind.PackageReferenceAttribute,
                 $"PackageReference:{packageId}:attribute"));
+
+    private static (SelectionEntry Entry, PackageGroup Group) SinglePackage(
+        string current, SemanticVersion? latestMinor, SemanticVersion? latestMajor)
+    {
+        var root = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        var project = Path.Combine(root, "App.csproj");
+        var occurrence = Occurrence(project, "Example.Package", current);
+        return (
+            new SelectionEntry(project, root, EntryKind.StandaloneProject, [project]),
+            new PackageGroup(occurrence.PackageId, [occurrence], latestMinor, latestMajor, null));
+    }
 }

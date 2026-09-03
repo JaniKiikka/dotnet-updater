@@ -299,24 +299,58 @@ public sealed class ConsoleApplication(
         if (mode is null) throw new OperationCanceledException();
 
         var decisions = new Dictionary<string, PackageDecision>(StringComparer.OrdinalIgnoreCase);
+        var createdAt = DateTimeOffset.UtcNow;
+        UpgradePlan preview;
         if (mode.Mode is UpgradeMode.LatestMinor or UpgradeMode.LatestMajor)
         {
             var choice = mode.Mode == UpgradeMode.LatestMinor ? UpgradeChoice.LatestMinor : UpgradeChoice.LatestMajor;
             foreach (var group in resolved) decisions[group.PackageId] = UpgradePlanner.AutomaticDecision(group, choice);
             foreach (var forced in forcedVersions.Where(x => decisions.ContainsKey(x.Key)))
                 decisions[forced.Key] = new(forced.Key, UpgradeChoice.ExactVersion, forced.Value);
+
+            preview = planner.Create(
+                selected, resolved, decisions, PreviewGitWorkflow, createdAt);
         }
         else if (mode.Mode == UpgradeMode.SelectPackages)
         {
-            var manual = await PresentAsync(
-                mainHost,
-                "Select package upgrades",
-                new PackageDecisionContent(resolved, forcedVersions),
-                cancellationToken,
-                width: 110,
-                height: 32).ConfigureAwait(false);
-            if (manual is null) throw new OperationCanceledException();
-            foreach (var decision in manual.Decisions) decisions[decision.PackageId] = decision;
+            while (true)
+            {
+                decisions.Clear();
+                var manual = await PresentAsync(
+                    mainHost,
+                    "Select package upgrades",
+                    new PackageDecisionContent(resolved, forcedVersions),
+                    cancellationToken,
+                    width: 110,
+                    height: 32).ConfigureAwait(false);
+                if (manual is null) throw new OperationCanceledException();
+                foreach (var decision in manual.Decisions) decisions[decision.PackageId] = decision;
+
+                preview = planner.Create(
+                    selected, resolved, decisions, PreviewGitWorkflow, createdAt);
+                if (preview.Repositories.Length > 0) break;
+
+                var action = await PresentAsync(
+                    mainHost,
+                    "Nothing to update",
+                    new NoUpdatesContent(NoUpdatesMessage(resolved, decisions, canGoBack: true)),
+                    cancellationToken,
+                    width: 92,
+                    height: 18).ConfigureAwait(false);
+                if (action != NoUpdatesAction.Back) return 0;
+            }
+        }
+        else
+        {
+            preview = planner.CreateValidatedIncremental(
+                selected, resolved, forcedVersions, PreviewGitWorkflow, createdAt);
+        }
+
+        if (preview.Repositories.Length == 0)
+        {
+            await ShowMessageAsync(mainHost, "Nothing to update",
+                NoUpdatesMessage(resolved, decisions, canGoBack: false), cancellationToken).ConfigureAwait(false);
+            return 0;
         }
 
         var gitWorkflow = await ReadGitWorkflowAsync(context, configuration).ConfigureAwait(false);
@@ -326,19 +360,13 @@ public sealed class ConsoleApplication(
                 resolved,
                 forcedVersions,
                 gitWorkflow,
-                DateTimeOffset.UtcNow)
+                createdAt)
             : planner.Create(
                 selected,
                 resolved,
                 decisions,
                 gitWorkflow,
-                DateTimeOffset.UtcNow);
-        if (plan.Repositories.Length == 0)
-        {
-            await ShowMessageAsync(mainHost, "Nothing to update",
-                "The selected decisions produce no upgrades. No files will be changed.", cancellationToken).ConfigureAwait(false);
-            return 0;
-        }
+                createdAt);
 
         var reviewApproved = await ConfirmLargeAsync(
             mainHost,
@@ -722,5 +750,20 @@ public sealed class ConsoleApplication(
 
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+
+    private static GitWorkflowOptions PreviewGitWorkflow { get; } = new("origin", null, null, false);
+
+    private static string NoUpdatesMessage(
+        IEnumerable<PackageGroup> groups,
+        IReadOnlyDictionary<string, PackageDecision> decisions,
+        bool canGoBack)
+    {
+        var packageGroups = groups.ToArray();
+        if (packageGroups.All(x => x.ResolutionError is not null))
+            return "No package target could be resolved from the configured NuGet sources, so no repository edits are eligible.";
+        if (canGoBack && decisions.Count > 0 && decisions.Values.All(x => x.Choice == UpgradeChoice.NoUpdate))
+            return "Every package is set to No update, so no repository edits are eligible. Choose Back to revise package decisions, or Close to end the run.";
+        return "All resolved targets are already current, unavailable, or otherwise produce no repository edits.";
+    }
 
 }

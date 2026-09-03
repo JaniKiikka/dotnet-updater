@@ -611,6 +611,28 @@ internal sealed class ScrollableMessageContent : IFlowStepContent<bool>
     }
 }
 
+internal enum NoUpdatesAction { Back, Close }
+
+internal sealed class NoUpdatesContent(string message) : IFlowStepContent<NoUpdatesAction>
+{
+    private readonly TaskCompletionSource<NoUpdatesAction> completion =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task<NoUpdatesAction> Completion => completion.Task;
+    public event Action? StateChanged;
+
+    public IWindowControl BuildContent(FlowChrome chrome)
+    {
+        var panel = TuiChrome.ScrollableBody();
+        panel.AddControl(Ctl.Markup(message).WithMargin(1).Build());
+        StateChanged?.Invoke();
+        return TuiChrome.View(
+            panel,
+            TuiChrome.Danger("Close", (_, _) => completion.TrySetResult(NoUpdatesAction.Close)),
+            TuiChrome.Primary("Back", (_, _) => completion.TrySetResult(NoUpdatesAction.Back)));
+    }
+}
+
 internal sealed class ScrollableConfirmationContent : IFlowStepContent<bool>
 {
     private readonly TaskCompletionSource<bool> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
